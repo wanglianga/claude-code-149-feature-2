@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 端到端验证：预约防重 / 支付超时 / 灯控预热 / 闸机窗口 / 爽约 / 场馆原因 /
-# 灯开未上场 / 前一场延时补偿 / 拼场超员 / 会员权益 / 高峰退订 / 临时加场 / 客服争议
+# 灯开未上场 / 前一场延时补偿 / 拼场超员 / 会员权益 / 高峰退订 / 临时加场 / 客服争议 /
+# 场地维护临时换场（换场/顺延/退款 + 前台验收 + 清场提醒 + 未响应兜底）
 # 说明：服务以 ALLOW_TEST_CLOCK=1 DISABLE_BG_JOBS=1 启动，脚本通过虚拟时钟+显式触发后台任务保证确定性。
+# 高峰相关断言按“明天/D2 是星期几”动态选择高峰时段（周末 10:00 / 工作日 19:00），日期无关可重复。
 set -u
 BASE="${BASE:-http://127.0.0.1:18080}"
 PASS=0; FAIL=0
@@ -9,9 +11,15 @@ PASS=0; FAIL=0
 # D0 = 明天 00:00 UTC（脚本运行当天服务可用；明天一定在营业）
 TOMORROW=$(date -u -d 'tomorrow' +%Y-%m-%d)
 BASE0=$(date -u -d "$TOMORROW 00:00" +%s)
-# D2 = D0 + 2 天（工作日，用于 48h 会员优先窗口验证）
+# D2 = D0 + 2 天（用于 48h 会员优先窗口验证）
 D2=$(date -u -d "$TOMORROW +2 days" +%Y-%m-%d)
-T_D2_19=$(date -u -d "$D2 19:00" +%s)
+# 高峰时段按星期动态选择：周末高峰 09-12/14-17，工作日高峰 18-21。
+# 这样无论明天是工作日还是周末，断言都稳定。
+DOW=$(date -u -d "$TOMORROW" +%u)          # 1=周一 .. 7=周日
+if [ "$DOW" -ge 6 ]; then PEAK_H=10; else PEAK_H=19; fi
+D2_DOW=$(date -u -d "$D2" +%u)
+if [ "$D2_DOW" -ge 6 ]; then D2_PEAK_H=10; else D2_PEAK_H=19; fi
+T_D2_PEAK=$(date -u -d "$D2 $D2_PEAK_H:00" +%s)
 
 hm() { echo $(( BASE0 + $1*3600 )); }                 # 当天第 N 小时
 iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
@@ -53,6 +61,8 @@ GOLD=$(login_member 13800000003)
 T_CONC=$(reg 13900001001 并发会员); T_GATE=$(reg 13900001002 闸机会员)
 T_NS=$(reg 13900001003 爽约会员); T_LIGHT=$(reg 13900001004 灯光会员)
 T_OVR=$(reg 13900001005 延时会员); T_OL=$(reg 13900001006 超员会员)
+T_RL1=$(reg 13900001011 换场会员); T_RL2=$(reg 13900001012 顺延会员)
+T_RL4=$(reg 13900001014 未响应会员)
 
 echo "================ 场景 1：并发预约同一场地，只能成功一单 ================"
 S1=$(hm 8); E1=$(( S1+3600 )); adv $(( S1-1200 ))
@@ -105,14 +115,18 @@ check "撤销后 verdict=excused" excused "$(api GET /api/v1/bookings/$B4 "$T_NS
 TL=$(api GET /api/v1/bookings/$B4/timeline "$CS")
 truthy "timeline 含支付/闸机/事件记录" "$(echo "$TL" | jq '(.payments|length)>=1 and (.events|length)>=3')"
 
-echo "================ 场景 5：场地临时维护 -> 场馆原因全额退款；维护期不可订 ================"
+echo "================ 场景 5：场地临时维护 -> 生成换场方案；用户选退款 -> 场馆原因全额退款 ================"
 S5=$(hm 13); S5=$(( S5+30*60 )); E5=$(( S5+3600 )); adv $(( S5-1200 ))
 B5=$(mk "$T_NS" 6 "$S5" "$E5" | bid); pay $B5 "$T_NS"
 PAID5=$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .paid_cents)
-api POST /api/v1/operator/maintenances "$OPS" "$(jq -nc --arg s "$(iso $S5)" --arg e "$(iso $E5)" '{venue_id:1,court_id:6,start_time:$s,end_time:$e,reason:"地胶维修"}')" >/dev/null
-check "维护覆盖订单 -> venue_fault" venue_fault "$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .status)"
-check "场馆原因全额退款(=已付 $PAID5)" "$PAID5" "$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .refunded_cents)"
+M5=$(api POST /api/v1/operator/maintenances "$OPS" "$(jq -nc --arg s "$(iso $S5)" --arg e "$(iso $E5)" '{venue_id:1,court_id:6,start_time:$s,end_time:$e,reason:"地胶维修"}')")
+check "维护锁定为未开场订单生成换场方案" 1 "$(echo "$M5" | jq '.offers|length')"
+check "方案待确认时订单保持 paid" paid "$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .status)"
+check "维护原因已写入订单(防误判占场)" 地胶维修 "$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .maintenance_reason)"
 check "维护时段新预约被拒 MAINTENANCE" MAINTENANCE "$(mk "$T_NS" 6 "$S5" "$E5" | jq -r '.error.code // empty')"
+api POST /api/v1/bookings/$B5/relocation-offer/accept "$T_NS" '{"action":"refund"}' >/dev/null
+check "用户选择退款 -> venue_fault" venue_fault "$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .status)"
+check "场馆原因全额退款(=已付 $PAID5)" "$PAID5" "$(api GET /api/v1/bookings/$B5 "$T_NS" | jq -r .refunded_cents)"
 
 echo "================ 场景 6：人工开灯但无人上场 -> ambiguous 争议 ================"
 S6=$(hm 15); E6=$(( S6+3600 )); adv $(( S6-1200 ))
@@ -166,10 +180,10 @@ check "超员费 4000 分(20 元/人)" 4000 "$(echo "$B8J" | jq -r .overlimit_ce
 api POST /api/v1/bookings/$B8/waive-overlimit "$FRONT" >/dev/null
 check "前台减免后超员费=0" 0 "$(api GET /api/v1/bookings/$B8 "$T_OL" | jq -r .overlimit_cents)"
 
-echo "================ 场景 9：金卡 8 折 + 免费时长全额抵扣（周末高峰 10:00） ================"
-S9=$(hm 10); E9=$(( S9+3600 )); adv $(( S9-1200 ))
+echo "================ 场景 9：金卡 8 折 + 免费时长全额抵扣（高峰 ${PEAK_H}:00） ================"
+S9=$(hm $PEAK_H); E9=$(( S9+3600 )); adv $(( S9-1200 ))
 Q9=$(api POST /api/v1/quotes "" "$(jq -nc --arg s "$(iso $S9)" --arg e "$(iso $E9)" '{venue_id:1,member_id:3,start_time:$s,end_time:$e}')")
-check "金卡周末高峰场地费原价 10000" 10000 "$(echo "$Q9" | jq -r .court_fee_cents)"
+check "金卡高峰场地费原价 10000" 10000 "$(echo "$Q9" | jq -r .court_fee_cents)"
 check "金卡 8 折折后场地费 8000" 8000 "$(echo "$Q9" | jq -r '.court_fee_cents-.discount_cents')"
 B9=$(mk "$GOLD" 4 "$S9" "$E9" | bid); pay $B9 "$GOLD"
 B9J=$(api GET /api/v1/bookings/$B9 "$GOLD")
@@ -177,11 +191,11 @@ check "金卡免费时长抵扣 60 分钟" 60 "$(echo "$B9J" | jq -r .benefit_mi
 check "抵扣后应付 0 分" 0 "$(echo "$B9J" | jq -r .payable_cents)"
 
 echo "================ 场景 10：高峰退订规则（>=24h 退 80%）+ 幂等 ================"
-adv $(( T_D2_19-25*3600 ))   # 距开场 25 小时
-E10=$(( T_D2_19+3600 ))
+adv $(( T_D2_PEAK-25*3600 ))   # 距开场 25 小时
+E10=$(( T_D2_PEAK+3600 ))
 KEY="idem-$(date +%s%N)"
-R1=$(mk "$GOLD" 5 "$T_D2_19" "$E10" "{\"idempotency_key\":\"$KEY\",\"use_benefit\":false}")
-R2=$(mk "$GOLD" 5 "$T_D2_19" "$E10" "{\"idempotency_key\":\"$KEY\",\"use_benefit\":false}")
+R1=$(mk "$GOLD" 5 "$T_D2_PEAK" "$E10" "{\"idempotency_key\":\"$KEY\",\"use_benefit\":false}")
+R2=$(mk "$GOLD" 5 "$T_D2_PEAK" "$E10" "{\"idempotency_key\":\"$KEY\",\"use_benefit\":false}")
 check "幂等重试返回同一订单" "$(echo "$R1" | jq -r .booking.id)" "$(echo "$R2" | jq -r .booking.id)"
 B10=$(echo "$R1" | bid); PAID10=$(echo "$R1" | jq -r .booking.payable_cents); pay $B10 "$GOLD"
 check "高峰提前>=24h 退款比例 80%" 80 "$(api POST /api/v1/bookings/$B10/quote-cancel "$GOLD" | jq -r .refund_percent)"
@@ -191,7 +205,7 @@ check "订单 cancelled" cancelled "$(echo "$CAN" | jq -r .booking.status)"
 
 echo "================ 场景 11：普通会员抢 24h 外高峰被会员优先规则拒绝 ================"
 check "普通会员超优先窗口 -> MEMBER_ONLY_PEAK" MEMBER_ONLY_PEAK \
-  "$(mk "$T_GATE" 6 "$T_D2_19" "$E10" | jq -r '.error.code // empty')"
+  "$(mk "$T_GATE" 6 "$T_D2_PEAK" "$E10" | jq -r '.error.code // empty')"
 
 echo "================ 场景 12：临时加场（当天 23:00-23:30 营业时段外可约） ================"
 adv $(hm 22)
@@ -223,6 +237,86 @@ check "有退款申请但无到场 -> ambiguous" ambiguous "$(api GET /api/v1/bo
 D14=$(api GET "/api/v1/cs/disputes?status=open" "$CS" | jq "[.disputes[]|select(.booking_id==$B14)][0].id")
 api POST /api/v1/cs/disputes/$D14/resolve "$CS" '{"action":"reject","note":"规则内爽约不退"}' >/dev/null
 check "客服驳回后争议单 resolved" resolved "$(api GET "/api/v1/cs/disputes?status=resolved" "$CS" | jq -r --argjson id "$D14" '[.disputes[]|select(.id==$id)][0].status')"
+
+echo "================ 场景 15：场地维护临时换场（换场/顺延/验收/清场提醒/未响应兜底） ================"
+# --- 15A 用户已扫码进旧场地 -> 换场到更高价 VIP 场地，差价场馆承担，权限同步新场地 ---
+S15=$(hm 13); E15=$(( S15+3600 )); adv $(( S15-1800 ))          # 明天 13:00-14:00（任何星期都非高峰）
+B15A=$(mk "$T_RL1" 3 "$S15" "$E15" | bid); pay $B15A "$T_RL1"
+PAID15A=$(api GET /api/v1/bookings/$B15A "$T_RL1" | jq -r .paid_cents)   # 6000
+CODE15A=$(api GET /api/v1/bookings/$B15A "$T_RL1" | jq -r .entry_code)
+adv $(( S15-10*60 ))
+check "换场前用户扫码进入旧场地" allowed "$(api POST /api/v1/devices/gate/scan "" "$(jq -nc --arg c "$CODE15A" '{entry_code:$c,device_id:"G3"}')" | jq -r .result)"
+M15=$(api POST /api/v1/operator/maintenances "$OPS" "$(jq -nc --arg s "$(iso $S15)" --arg e "$(iso $((S15+5*3600)))" '{venue_id:1,court_id:3,start_time:$s,end_time:$e,reason:"地胶起翘"}')")
+MID15=$(echo "$M15" | jq -r .maintenance.id)
+check "维护生成 1 个换场方案" 1 "$(echo "$M15" | jq '.offers|length')"
+check "已进场订单标记需要清场" true "$(echo "$M15" | jq '.offers[0].clearance_needed')"
+check "方案待确认订单仍 paid" paid "$(api GET /api/v1/bookings/$B15A "$T_RL1" | jq -r .status)"
+check "维护原因写入旧订单" 地胶起翘 "$(api GET /api/v1/bookings/$B15A "$T_RL1" | jq -r .maintenance_reason)"
+NOTIF=$(api GET "/api/v1/front/notifications?status=pending" "$FRONT")
+NID=$(echo "$NOTIF" | jq "[.notifications[]|select(.booking_id==$B15A and .type==\"clearance_reminder\")][0].id")
+truthy "旧场地清场提醒已生成" "$([ "$NID" != null ] && echo true)"
+OFFER15=$(api GET /api/v1/bookings/$B15A/relocation-offer "$T_RL1")
+check "方案状态 pending" pending "$(echo "$OFFER15" | jq -r .status)"
+check "候选含 VIP 场地 9 且差价 3000 场馆承担" 3000 "$(echo "$OFFER15" | jq '[.candidates[]|select(.court_id==9)][0].price_diff_cents')"
+truthy "候选含同价普通场地(差价 0)" "$(echo "$OFFER15" | jq '[.candidates[]|select(.price_diff_cents==0)]|length>=1')"
+ACC15=$(api POST /api/v1/bookings/$B15A/relocation-offer/accept "$T_RL1" '{"action":"relocate","court_id":9}')
+NB15=$(echo "$ACC15" | jq -r .new_booking.id)
+check "换场确认 -> accepted_relocate" accepted_relocate "$(echo "$ACC15" | jq -r .offer.status)"
+check "高价差价 3000 由场馆承担" 3000 "$(echo "$ACC15" | jq -r .offer.venue_subsidy_cents)"
+check "新订单在 VIP 场地 9" 9 "$(echo "$ACC15" | jq -r .new_booking.court_id)"
+check "用户不补差价(应付仍 $PAID15A)" "$PAID15A" "$(echo "$ACC15" | jq -r .new_booking.payable_cents)"
+check "已支付金额同步到新订单" "$PAID15A" "$(echo "$ACC15" | jq -r .new_booking.paid_cents)"
+check "已进预热窗口新场地直接 warming" warming "$(echo "$ACC15" | jq -r .new_booking.status)"
+check "旧订单 -> relocated" relocated "$(echo "$ACC15" | jq -r .old_booking.status)"
+check "旧订单指向新订单" "$NB15" "$(echo "$ACC15" | jq -r .old_booking.superseded_by)"
+check "旧入场码已作废" denied "$(api POST /api/v1/devices/gate/scan "" "$(jq -nc --arg c "$CODE15A" '{entry_code:$c,device_id:"G3"}')" | jq -r .result)"
+CODE15N=$(api GET /api/v1/bookings/$NB15 "$T_RL1" | jq -r .entry_code)
+check "新入场码闸机放行(权限已同步)" allowed "$(api POST /api/v1/devices/gate/scan "" "$(jq -nc --arg c "$CODE15N" '{entry_code:$c,device_id:"G9"}')" | jq -r .result)"
+TLN=$(api GET /api/v1/bookings/$NB15/timeline "$CS")
+truthy "灯控权限同步:新场地预热记录" "$(echo "$TLN" | jq '[.light_records[]|select(.court_id==9 and .action=="warmup")]|length>=1')"
+truthy "权限同步事件留痕" "$(echo "$TLN" | jq '[.events[]|select(.event_type=="relocate.permission_synced")]|length>=1')"
+truthy "款项迁移留痕(transfer $PAID15A)" "$(echo "$TLN" | jq --argjson p "$PAID15A" '[.payments[]|select(.method=="transfer")]|map(.amount_cents)|add==$p')"
+TLO=$(api GET /api/v1/bookings/$B15A/timeline "$CS")
+truthy "旧场地灯控关闭留痕" "$(echo "$TLO" | jq '[.light_records[]|select(.court_id==3 and .action=="off")]|length>=1')"
+check "前台确认清场 -> done" done "$(api POST /api/v1/front/notifications/$NID/ack "$FRONT" | jq -r .status)"
+
+# --- 15B 维护完工 -> 前台验收 -> 验收通过才重新开放；用户选择顺延 ---
+adv $(( S15+70*60 ))                                            # 14:10，维护窗口内
+api POST /api/v1/operator/maintenances/$MID15/finish "$OPS" >/dev/null
+check "完工后 -> acceptance_pending" acceptance_pending "$(api GET /api/v1/operator/maintenances?venue_id=1 "$OPS" | jq -r --argjson id "$MID15" '[.maintenances[]|select(.id==$id)][0].status')"
+check "待验收期间新预约仍被拒" MAINTENANCE "$(mk "$T_RL2" 3 "$((S15+2*3600))" "$((S15+3*3600))" | jq -r '.error.code // empty')"
+api POST /api/v1/operator/maintenances/$MID15/accept "$FRONT" '{"pass":false,"note":"地胶仍起翘，继续维修"}' >/dev/null
+check "验收不通过 -> 回到 active" active "$(api GET /api/v1/operator/maintenances?venue_id=1 "$OPS" | jq -r --argjson id "$MID15" '[.maintenances[]|select(.id==$id)][0].status')"
+check "验收不通过场地仍锁定" MAINTENANCE "$(mk "$T_RL2" 3 "$((S15+2*3600))" "$((S15+3*3600))" | jq -r '.error.code // empty')"
+api POST /api/v1/operator/maintenances/$MID15/finish "$OPS" >/dev/null
+check "前台验收通过 -> released" released "$(api POST /api/v1/operator/maintenances/$MID15/accept "$FRONT" '{"pass":true,"note":"验收合格"}' | jq -r .status)"
+B15B=$(mk "$T_RL2" 3 "$((S15+2*3600))" "$((S15+3*3600))" | bid)  # 15:00-16:00，验收通过后可约
+truthy "验收通过后场地重新开放可约" "$([ "${B15B:-null}" != null ] && echo true)"
+pay $B15B "$T_RL2"
+M15B=$(api POST /api/v1/operator/maintenances "$OPS" "$(jq -nc --arg s "$(iso $((S15+2*3600)))" --arg e "$(iso $((S15+3*3600)))" '{venue_id:1,court_id:3,start_time:$s,end_time:$e,reason:"地胶再次起翘"}')")
+MID15B=$(echo "$M15B" | jq -r .maintenance.id)
+check "未进场订单无需清场" false "$(echo "$M15B" | jq -r '.offers[0].clearance_needed')"
+api POST /api/v1/operator/maintenances/$MID15B/finish "$OPS" >/dev/null
+api POST /api/v1/operator/maintenances/$MID15B/accept "$FRONT" '{"pass":true,"note":"验收合格"}' >/dev/null
+check "顺延时长不一致被拒" BAD_DURATION "$(api POST /api/v1/bookings/$B15B/relocation-offer/accept "$T_RL2" "$(jq -nc --arg s "$(iso $((S15+3*3600)))" --arg e "$(iso $((S15+3*3600+1800)))" '{action:"postpone",start_time:$s,end_time:$e}')" | jq -r '.error.code // empty')"
+ACC15B=$(api POST /api/v1/bookings/$B15B/relocation-offer/accept "$T_RL2" "$(jq -nc --arg s "$(iso $((S15+3*3600)))" --arg e "$(iso $((S15+4*3600)))" '{action:"postpone",start_time:$s,end_time:$e}')")
+check "顺延确认 -> accepted_postpone" accepted_postpone "$(echo "$ACC15B" | jq -r .offer.status)"
+check "顺延新订单同场地同时长(16:00-17:00)" "$(($S15+3*3600))" "$(echo "$ACC15B" | jq -r '.new_booking.start_time' | xargs -I{} date -u -d {} +%s)"
+check "顺延订单保持 paid" paid "$(echo "$ACC15B" | jq -r .new_booking.status)"
+check "顺延旧订单 -> relocated" relocated "$(echo "$ACC15B" | jq -r .old_booking.status)"
+
+# --- 15C 用户不响应 -> 裁决兜底：场馆原因全额退款，方案自动失效，不误判占场 ---
+adv $(( S15+100*60 ))
+B15D=$(mk "$T_RL4" 10 "$((S15+2*3600))" "$((S15+3*3600))" | bid); pay $B15D "$T_RL4"
+PAID15D=$(api GET /api/v1/bookings/$B15D "$T_RL4" | jq -r .paid_cents)
+api POST /api/v1/operator/maintenances "$OPS" "$(jq -nc --arg s "$(iso $((S15+2*3600)))" --arg e "$(iso $((S15+3*3600)))" '{venue_id:1,court_id:10,start_time:$s,end_time:$e,reason:"地胶起翘"}')" >/dev/null
+check "未响应用户方案已生成" pending "$(api GET /api/v1/bookings/$B15D/relocation-offer "$T_RL4" | jq -r .status)"
+adv $(( S15+2*3600+25*60 )); job_judge
+check "未响应 -> 场馆原因 venue_fault" venue_fault "$(api GET /api/v1/bookings/$B15D "$T_RL4" | jq -r .status)"
+check "未响应 -> 全额退款(=已付 $PAID15D)" "$PAID15D" "$(api GET /api/v1/bookings/$B15D "$T_RL4" | jq -r .refunded_cents)"
+check "未响应 -> 方案自动 expired" expired "$(api GET /api/v1/bookings/$B15D/relocation-offer "$T_RL4" | jq -r .status)"
+check "未响应不计爽约(次数 0)" 0 "$(api POST /api/v1/auth/login/member "" '{"phone":"13900001014","password":"123456"}' | jq -r .member.no_show_count)"
+check "换场用户不计爽约(次数 0)" 0 "$(api POST /api/v1/auth/login/member "" '{"phone":"13900001011","password":"123456"}' | jq -r .member.no_show_count)"
 
 advReal 0
 echo; echo "================================ 结果汇总 ================================"

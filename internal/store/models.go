@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Venue 场馆
 type Venue struct {
@@ -28,11 +31,12 @@ type Venue struct {
 }
 
 type Court struct {
-	ID       int64  `json:"id"`
-	VenueID  int64  `json:"venue_id"`
-	CourtNo  string `json:"court_no"`
-	Capacity int    `json:"capacity"`
-	Status   string `json:"status"`
+	ID                int64  `json:"id"`
+	VenueID           int64  `json:"venue_id"`
+	CourtNo           string `json:"court_no"`
+	Capacity          int    `json:"capacity"`
+	Status            string `json:"status"`
+	PriceCentsPerHour *int64 `json:"price_cents_per_hour"` // null = 用场馆统一价
 }
 
 type Member struct {
@@ -80,17 +84,22 @@ type ExtraSlot struct {
 }
 
 type Maintenance struct {
-	ID         int64      `json:"id"`
-	VenueID    int64      `json:"venue_id"`
-	CourtID    int64      `json:"court_id"`
-	StartTime  time.Time  `json:"start_time"`
-	EndTime    time.Time  `json:"end_time"`
-	Reason     string     `json:"reason"`
-	Status     string     `json:"status"`
-	CreatedBy  *int64     `json:"created_by"`
-	ReleasedBy *int64     `json:"released_by"`
-	ReleasedAt *time.Time `json:"released_at"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID             int64      `json:"id"`
+	VenueID        int64      `json:"venue_id"`
+	CourtID        int64      `json:"court_id"`
+	StartTime      time.Time  `json:"start_time"`
+	EndTime        time.Time  `json:"end_time"`
+	Reason         string     `json:"reason"`
+	Status         string     `json:"status"` // active / acceptance_pending / released
+	CreatedBy      *int64     `json:"created_by"`
+	ReleasedBy     *int64     `json:"released_by"`
+	ReleasedAt     *time.Time `json:"released_at"`
+	FinishedBy     *int64     `json:"finished_by"`
+	FinishedAt     *time.Time `json:"finished_at"`
+	AcceptedBy     *int64     `json:"accepted_by"`
+	AcceptedAt     *time.Time `json:"accepted_at"`
+	AcceptanceNote string     `json:"acceptance_note"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 type Booking struct {
@@ -143,6 +152,8 @@ type Booking struct {
 	JudgedAt              *time.Time `json:"judged_at"`
 	JudgeSource           *string    `json:"judge_source"`
 	Note                  string     `json:"note"`
+	MaintenanceReason     string     `json:"maintenance_reason"` // 场馆维护原因（换场/场馆原因时写入，防误判用户占场）
+	SupersededBy          *int64     `json:"superseded_by"`      // 换场/顺延后的新订单
 	CreatedSource         string     `json:"created_source"`
 	Version               int64      `json:"version"`
 	CreatedAt             time.Time  `json:"created_at"`
@@ -264,4 +275,47 @@ type BenefitGrant struct {
 	UsedBookingID *int64     `json:"used_booking_id"`
 	UsedAt        *time.Time `json:"used_at"`
 	CreatedAt     time.Time  `json:"created_at"`
+}
+
+// RelocationCandidate 换场候选场地（同时间可用，含相对原场地费的差价）
+type RelocationCandidate struct {
+	CourtID           int64  `json:"court_id"`
+	CourtNo           string `json:"court_no"`
+	Capacity          int    `json:"capacity"`
+	PriceCentsPerHour int64  `json:"price_cents_per_hour"` // 该场地实际 hourly 价
+	PriceDiffCents    int64  `json:"price_diff_cents"`     // 相对原订单场地费差价；>0 时由场馆承担
+}
+
+// RelocationOffer 场地维护触发的换场方案
+type RelocationOffer struct {
+	ID                int64           `json:"id"`
+	BookingID         int64           `json:"booking_id"`
+	MaintenanceID     int64           `json:"maintenance_id"`
+	VenueID           int64           `json:"venue_id"`
+	OldCourtID        int64           `json:"old_court_id"`
+	Status            string          `json:"status"` // pending / accepted_relocate / accepted_postpone / refunded / expired
+	Candidates        json.RawMessage `json:"candidates"`
+	ClearanceNeeded   bool            `json:"clearance_needed"`
+	Resolution        json.RawMessage `json:"resolution"`
+	NewBookingID      *int64          `json:"new_booking_id"`
+	VenueSubsidyCents int64           `json:"venue_subsidy_cents"`
+	Reason            string          `json:"reason"`
+	CreatedBy         *int64          `json:"created_by"`
+	DecidedBy         *int64          `json:"decided_by"`
+	DecidedAt         *time.Time      `json:"decided_at"`
+	CreatedAt         time.Time       `json:"created_at"`
+}
+
+// OpsNotification 前台/运营待办通知（如旧场地清场提醒）
+type OpsNotification struct {
+	ID        int64      `json:"id"`
+	VenueID   int64      `json:"venue_id"`
+	CourtID   *int64     `json:"court_id"`
+	BookingID *int64     `json:"booking_id"`
+	Type      string     `json:"type"`
+	Message   string     `json:"message"`
+	Status    string     `json:"status"`
+	CreatedAt time.Time  `json:"created_at"`
+	AckedBy   *int64     `json:"acked_by"`
+	AckedAt   *time.Time `json:"acked_at"`
 }

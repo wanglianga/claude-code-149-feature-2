@@ -98,6 +98,10 @@ func (s *Service) CancelBooking(ctx context.Context, bookingID int64, source str
 		if err := releaseReservedBenefit(ctx, tx, b); err != nil {
 			return err
 		}
+		// 退订后待确认换场方案失效
+		if err := expireOffersForBooking(ctx, tx, b.ID); err != nil {
+			return err
+		}
 		if refund > 0 {
 			if _, err := tx.Exec(ctx,
 				`insert into payments(booking_id,kind,amount_cents,method,status,transaction_no,reason,created_source,created_by)
@@ -202,12 +206,13 @@ func (s *Service) AutoLightControl(ctx context.Context) (int, error) {
 	now := s.now(ctx)
 	processed := 0
 
-	// 1) 预热（只对尚未开场的订单）
+	// 1) 预热（只对尚未开场、且没有待确认换场方案的订单）
 	rows, err := s.pool().Query(ctx, `
 		select b.id from bookings b join venues v on v.id=b.venue_id
 		where b.status='paid'
 		  and b.start_time - (v.light_warmup_minutes::int * interval '1 minute') <= $1
-		  and b.start_time > $1`, now)
+		  and b.start_time > $1
+		  and not exists(select 1 from relocation_offers o where o.booking_id=b.id and o.status='pending')`, now)
 	if err != nil {
 		return 0, err
 	}
@@ -227,11 +232,13 @@ func (s *Service) AutoLightControl(ctx context.Context) (int, error) {
 		}
 	}
 
-	// 2) 到点自动开灯（仅开场后宽限窗口内，避免给已严重迟到的订单自动开灯）
+	// 2) 到点自动开灯（仅开场后宽限窗口内，避免给已严重迟到的订单自动开灯；
+	//    待确认换场方案的订单不在旧场地自动开灯）
 	rows, err = s.pool().Query(ctx, `
 		select b.id from bookings b join venues v on v.id=b.venue_id
 		where b.status='warming' and b.start_time <= $1
-		  and b.start_time + (v.late_grace_minutes::int * interval '1 minute') >= $1`, now)
+		  and b.start_time + (v.late_grace_minutes::int * interval '1 minute') >= $1
+		  and not exists(select 1 from relocation_offers o where o.booking_id=b.id and o.status='pending')`, now)
 	if err != nil {
 		return processed, err
 	}
@@ -301,9 +308,11 @@ func presenceEvidence(ctx context.Context, tx pgx.Tx, bookingID int64) (gateOK, 
 }
 
 func venueSideEvidence(ctx context.Context, tx pgx.Tx, b *store.Booking) (maint, prevRun, hasRefund bool, err error) {
+	// 维护证据：未释放（active/待验收）的窗口，或开场后才验收释放的窗口，都算场馆侧原因
 	if err = tx.QueryRow(ctx,
-		`select exists(select 1 from maintenance_windows where court_id=$1 and status='active'
-		  and tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)'))`,
+		`select exists(select 1 from maintenance_windows where court_id=$1
+		  and tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)')
+		  and (status <> 'released' or released_at > $2))`,
 		b.CourtID, b.StartTime, b.EndTime).Scan(&maint); err != nil {
 		return
 	}
@@ -477,6 +486,10 @@ func (s *Service) judgeOne(ctx context.Context, id int64, source string) error {
 			`update bookings set status=$2,verdict=$3,judge_source=$4,judged_at=$5,
 			 version=version+1,updated_at=now() where id=$1`,
 			b.ID, newStatus, ev.Verdict, ev.Source, now); err != nil {
+			return err
+		}
+		// 订单已被裁决（如维护未响应 -> 场馆原因自动退款），待确认换场方案随之失效
+		if err := expireOffersForBooking(ctx, tx, b.ID); err != nil {
 			return err
 		}
 

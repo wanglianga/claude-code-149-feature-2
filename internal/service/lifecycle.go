@@ -65,6 +65,15 @@ func (s *Service) GateScan(ctx context.Context, entryCode, deviceID string) (*Ga
 		case "completed":
 			res.Result, res.Reason = "denied", "订单已完成"
 			return record("denied", res.Reason)
+		case "venue_fault":
+			res.Result, res.Reason = "denied", "订单因场馆原因已退款关闭"
+			return record("denied", res.Reason)
+		case "disputed":
+			res.Result, res.Reason = "denied", "订单争议处理中，请联系前台"
+			return record("denied", res.Reason)
+		case "relocated":
+			res.Result, res.Reason = "denied", "订单已因场地维护换场/顺延，请使用新订单入场码"
+			return record("denied", res.Reason)
 		}
 
 		windowStart := b.StartTime.Add(-time.Duration(venue.CheckinWindowMinutes) * time.Minute)
@@ -340,12 +349,16 @@ func (s *Service) EndSession(ctx context.Context, bookingID int64, source string
 		if err != nil {
 			return err
 		}
+		court, err := s.loadCourt(ctx, tx, b.CourtID)
+		if err != nil {
+			return err
+		}
 		windows, err := s.peakWindows(ctx, tx, b.VenueID)
 		if err != nil {
 			return err
 		}
 		allowedEnd := b.EndTime.Add(time.Duration(b.CompBonusMinutes) * time.Minute)
-		otMin, otFee := overtimeFee(venue, windows, allowedEnd, now)
+		otMin, otFee := overtimeFee(venueWithRate(venue, effectiveRate(venue, court)), windows, allowedEnd, now)
 		if otFee < 0 {
 			otFee = 0
 		}

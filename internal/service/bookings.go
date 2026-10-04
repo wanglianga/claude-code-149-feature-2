@@ -356,17 +356,13 @@ func (s *Service) CreateBooking(ctx context.Context, in CreateBookingInput) (*Cr
 			}
 		}
 
-		// 维护锁定（含边界）
-		var blocked bool
-		if err := tx.QueryRow(ctx,
-			`select exists(select 1 from maintenance_windows
-			  where court_id=$1 and status='active'
-			  and tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)'))`,
-			court.ID, in.StartTime, in.EndTime).Scan(&blocked); err != nil {
+		// 维护锁定（含边界）；已报完工待验收的场地同样不开放
+		blocked, err := courtBlockedByMaintenance(ctx, tx, court.ID, in.StartTime, in.EndTime)
+		if err != nil {
 			return err
 		}
 		if blocked {
-			return ce("MAINTENANCE", "场地在该时段处于维护锁定状态", ErrMaintenance)
+			return ce("MAINTENANCE", "场地在该时段处于维护锁定/待验收状态", ErrMaintenance)
 		}
 
 		// 人数与容量
@@ -394,7 +390,7 @@ func (s *Service) CreateBooking(ctx context.Context, in CreateBookingInput) (*Cr
 			in.ShuttleCount = 0
 		}
 		bd := quote(priceInput{
-			venue: venue, policy: policy, peakWindows: windows,
+			venue: venueWithRate(venue, effectiveRate(venue, court)), policy: policy, peakWindows: windows,
 			start: in.StartTime, end: in.EndTime,
 			racketCount: in.RacketCount, shuttleCount: in.ShuttleCount,
 			availableBenefitM: avail,

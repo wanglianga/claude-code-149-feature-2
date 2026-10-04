@@ -163,6 +163,7 @@ func (s *Server) routes() {
 	m.HandleFunc("/api/v1/bookings", s.handleBookings)
 	m.HandleFunc("/api/v1/bookings/", s.dispatchBooking)
 	m.HandleFunc("/api/v1/me/bookings", s.handleMyBookings)
+	m.HandleFunc("/api/v1/me/relocation-offers", s.handleMyRelocationOffers)
 	m.HandleFunc("/api/v1/quotes", s.handleQuotes)
 
 	// 设备端
@@ -174,6 +175,11 @@ func (s *Server) routes() {
 	m.HandleFunc("/api/v1/operator/maintenances/", s.dispatchMaintenance)
 	m.HandleFunc("/api/v1/operator/extra-slots", s.handleExtraSlots)
 	m.HandleFunc("/api/v1/operator/rules/cancellation", s.handleCancelRules)
+	m.HandleFunc("/api/v1/operator/relocation-offers", s.handleRelocationOffers)
+
+	// 前台端（清场提醒等待办）
+	m.HandleFunc("/api/v1/front/notifications", s.handleFrontNotifications)
+	m.HandleFunc("/api/v1/front/notifications/", s.dispatchFrontNotification)
 
 	// 客服端
 	m.HandleFunc("/api/v1/cs/disputes", s.handleDisputes)

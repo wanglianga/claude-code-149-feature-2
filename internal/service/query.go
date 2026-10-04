@@ -131,7 +131,7 @@ func (s *Service) ListVenues(ctx context.Context) ([]store.Venue, error) {
 
 func (s *Service) ListCourts(ctx context.Context, venueID int64) ([]store.Court, error) {
 	rows, err := s.pool().Query(ctx,
-		`select id,venue_id,court_no,coalesce(capacity,0),status from courts where venue_id=$1 order by court_no`, venueID)
+		`select id,venue_id,court_no,coalesce(capacity,0),status,price_cents_per_hour from courts where venue_id=$1 order by court_no`, venueID)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func (s *Service) ListCourts(ctx context.Context, venueID int64) ([]store.Court,
 	var out []store.Court
 	for rows.Next() {
 		var c store.Court
-		if err := rows.Scan(&c.ID, &c.VenueID, &c.CourtNo, &c.Capacity, &c.Status); err != nil {
+		if err := rows.Scan(&c.ID, &c.VenueID, &c.CourtNo, &c.Capacity, &c.Status, &c.PriceCentsPerHour); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -209,11 +209,17 @@ func (s *Service) CourtDaySchedule(ctx context.Context, venueID, courtID int64, 
 		}
 		rows.Close()
 
-		type mw struct{ start, end time.Time }
+		type mw struct {
+			start, end time.Time
+			status     string
+		}
 		mrows, err := tx.Query(ctx,
-			`select start_time,end_time from maintenance_windows
-			 where court_id=$1 and status='active'
-			   and tstzrange(start_time,end_time,'[)') && tstzrange($2::timestamptz,($2::timestamptz + interval '1 day'),'[)')`,
+			`select start_time,end_time,status from maintenance_windows
+			 where court_id=$1 and (
+			   (status in ('active','acceptance_pending')
+			     and tstzrange(start_time,end_time,'[)') && tstzrange($2::timestamptz,($2::timestamptz + interval '1 day'),'[)'))
+			   or (status='acceptance_pending' and start_time < $2::timestamptz + interval '1 day')
+			 )`,
 			courtID, day)
 		if err != nil {
 			return err
@@ -221,7 +227,7 @@ func (s *Service) CourtDaySchedule(ctx context.Context, venueID, courtID int64, 
 		var mws []mw
 		for mrows.Next() {
 			var m mw
-			if err := mrows.Scan(&m.start, &m.end); err != nil {
+			if err := mrows.Scan(&m.start, &m.end, &m.status); err != nil {
 				mrows.Close()
 				return err
 			}
@@ -255,7 +261,10 @@ func (s *Service) CourtDaySchedule(ctx context.Context, venueID, courtID int64, 
 				slot.Status = "closed"
 			}
 			for _, m := range mws {
-				if st.Before(m.end) && en.After(m.start) {
+				overlap := st.Before(m.end) && en.After(m.start)
+				// 待验收：验收前场地不重新开放，后续时段全部按维护展示
+				pendingAccept := m.status == "acceptance_pending" && m.start.Before(en)
+				if overlap || pendingAccept {
 					slot.Status = "maintenance"
 				}
 			}
@@ -358,6 +367,7 @@ func itoaIdx(i int) string {
 
 type QuoteInput struct {
 	VenueID      int64
+	CourtID      int64 // 可选：传入则按该场地价格（单场地价格覆盖）报价
 	MemberID     int64
 	StartTime    time.Time
 	EndTime      time.Time
@@ -401,8 +411,16 @@ func (s *Service) Quote(ctx context.Context, in QuoteInput) (*QuoteOutput, error
 		if err != nil {
 			return err
 		}
+		rate := venue.PriceCentsPerHour
+		if in.CourtID > 0 {
+			court, err := s.loadCourt(ctx, tx, in.CourtID)
+			if err != nil {
+				return err
+			}
+			rate = effectiveRate(venue, court)
+		}
 		out.priceBreakdown = quote(priceInput{
-			venue: venue, policy: policy, peakWindows: windows,
+			venue: venueWithRate(venue, rate), policy: policy, peakWindows: windows,
 			start: in.StartTime, end: in.EndTime,
 			racketCount: in.RacketCount, shuttleCount: in.ShuttleCount,
 			availableBenefitM: avail,

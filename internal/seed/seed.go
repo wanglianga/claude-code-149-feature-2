@@ -67,6 +67,15 @@ func Seed(ctx context.Context, pool *pgxpool.Pool) error {
 			return err
 		}
 	}
+	// VIP 场地（单场地价格覆盖：90 元/小时）：用于「换到更高价场地，差价场馆承担」演示
+	for _, no := range []string{"09", "10"} {
+		if _, err := pool.Exec(ctx,
+			`insert into courts(venue_id,court_no,capacity,price_cents_per_hour) values($1,$2,6,9000)
+			 on conflict (venue_id,court_no) do update set price_cents_per_hour=excluded.price_cents_per_hour`,
+			venueID, no); err != nil {
+			return err
+		}
+	}
 
 	policies := []struct {
 		typ             string

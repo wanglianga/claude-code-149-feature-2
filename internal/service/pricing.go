@@ -77,25 +77,32 @@ func clockHM(hhmm string) int {
 	return h*60 + m
 }
 
-// quote 预约下单时的报价（按分钟分段，平峰/高峰分别计价，再叠加会员折扣与权益）
-func quote(in priceInput) priceBreakdown {
-	out := priceBreakdown{DurationMinutes: int(in.end.Sub(in.start).Minutes())}
-	rateNormal := in.venue.PriceCentsPerHour
-	ratePeak := int64(math.Round(float64(rateNormal) * in.venue.PeakMultiplier))
-
-	for m := 0; m < out.DurationMinutes; m++ {
-		at := in.start.Add(time.Duration(m) * time.Minute)
-		if isPeakAt(in.peakWindows, at) {
-			out.PeakMinutes++
+// courtFeeForSlot 按分钟分段计算某 hourly 价在 [start,end) 的场地费（平/高峰分别折算）。
+// 换场差价、单场地价格覆盖都复用这一份逻辑，保证与下单报价完全一致。
+func courtFeeForSlot(ratePerHour int64, peakMultiplier float64, windows []store.PeakWindow, start, end time.Time) (normalMin, peakMin int, fee int64) {
+	dur := int(end.Sub(start).Minutes())
+	ratePeak := int64(math.Round(float64(ratePerHour) * peakMultiplier))
+	for m := 0; m < dur; m++ {
+		at := start.Add(time.Duration(m) * time.Minute)
+		if isPeakAt(windows, at) {
+			peakMin++
 		} else {
-			out.NormalMinutes++
+			normalMin++
 		}
 	}
 	// 按平/高峰分钟数统一折算（整小时精确，避免逐分钟取整累积误差）
-	courtFee := int64(math.Round(float64(out.NormalMinutes)*float64(rateNormal)/60)) +
-		int64(math.Round(float64(out.PeakMinutes)*float64(ratePeak)/60))
+	fee = int64(math.Round(float64(normalMin)*float64(ratePerHour)/60)) +
+		int64(math.Round(float64(peakMin)*float64(ratePeak)/60))
+	return normalMin, peakMin, fee
+}
+
+// quote 预约下单时的报价（按分钟分段，平峰/高峰分别计价，再叠加会员折扣与权益）
+func quote(in priceInput) priceBreakdown {
+	out := priceBreakdown{DurationMinutes: int(in.end.Sub(in.start).Minutes())}
+	out.NormalMinutes, out.PeakMinutes, out.CourtFeeCents = courtFeeForSlot(
+		in.venue.PriceCentsPerHour, in.venue.PeakMultiplier, in.peakWindows, in.start, in.end)
 	out.IsPeak = out.PeakMinutes > 0
-	out.CourtFeeCents = courtFee
+	courtFee := out.CourtFeeCents
 
 	out.AddonCents = int64(in.racketCount)*in.venue.RacketFeeCents +
 		int64(in.shuttleCount)*in.venue.ShuttleFeeCents

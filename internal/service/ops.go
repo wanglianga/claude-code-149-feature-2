@@ -21,26 +21,43 @@ type MaintenanceInput struct {
 	StaffID   int64
 }
 
-// CreateMaintenance 运营锁定场地维护。若覆盖已预约订单：
-// paid/warming/in_use 的订单不阻塞锁定，但自动标记 venue_fault 并全额退款、开争议单；
-// held 订单直接过期释放。
-func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*store.Maintenance, error) {
+// MaintenanceResult 维护锁定的处理结果：受影响订单的去向一目了然
+type MaintenanceResult struct {
+	Maintenance *store.Maintenance       `json:"maintenance"`
+	Offers      []*store.RelocationOffer `json:"offers"`       // 为未开场订单生成的换场方案（待用户确认）
+	AutoFaulted []int64                  `json:"auto_faulted"` // 进行中订单：直接场馆原因全额退款
+	Expired     []int64                  `json:"expired"`      // 未支付订单：直接释放
+}
+
+// CreateMaintenance 运营锁定场地维护（如开场前发现地胶起翘）。对覆盖到的订单：
+//   - held：直接过期释放；
+//   - in_use（已开打）：无法换场，按场馆原因全额退款并开争议单；
+//   - paid/warming（预约开始前）：生成换场方案（relocation_offers），筛选同时间可用场地，
+//     用户可换场（差价场馆承担）、顺延或退款；已扫码进旧场地的订单同步生成清场提醒，
+//     并把维护原因写入订单，防止被误判为用户占场。
+func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*MaintenanceResult, error) {
 	in.StartTime = in.StartTime.UTC().Truncate(time.Minute)
 	in.EndTime = in.EndTime.UTC().Truncate(time.Minute)
 	if !in.EndTime.After(in.StartTime) {
 		return nil, ce("BAD_TIME", "维护结束时间必须晚于开始时间", ErrValidation)
 	}
-	var m store.Maintenance
+	res := &MaintenanceResult{
+		Offers:      []*store.RelocationOffer{},
+		AutoFaulted: []int64{},
+		Expired:     []int64{},
+	}
 	err := inTx(ctx, s.pool(), func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx,
 			`insert into maintenance_windows(venue_id,court_id,start_time,end_time,reason,created_by)
 			 values($1,$2,$3,$4,$5,$6)
-			 returning id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at`,
+			 returning `+maintenanceColumns,
 			in.VenueID, in.CourtID, in.StartTime, in.EndTime, in.Reason, in.StaffID)
-		if err := row.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason,
-			&m.Status, &m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt, &m.CreatedAt); err != nil {
+		m, err := scanMaintenance(row)
+		if err != nil {
 			return err
 		}
+		res.Maintenance = m
+
 		// 处理受影响订单
 		rows, err := tx.Query(ctx,
 			`select `+bookingColumns+` from bookings
@@ -60,49 +77,29 @@ func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*
 			affected = append(affected, b)
 		}
 		rows.Close()
+
 		for _, b := range affected {
-			if b.Status == "held" {
+			switch b.Status {
+			case "held":
 				if _, err := tx.Exec(ctx, `update bookings set status='expired',version=version+1,updated_at=now() where id=$1`, b.ID); err != nil {
 					return err
 				}
 				if err := releaseReservedBenefit(ctx, tx, b); err != nil {
 					return err
 				}
-			} else {
-				// paid / warming / in_use -> venue_fault 全额退款
-				if _, err := tx.Exec(ctx,
-					`update bookings set status='venue_fault',verdict='venue_fault',judge_source='maintenance',
-					 judged_at=now(),version=version+1,updated_at=now() where id=$1`, b.ID); err != nil {
+				res.Expired = append(res.Expired, b.ID)
+			case "in_use":
+				// 已开打的订单无法换场：场馆原因全额退款 + 开争议单
+				if err := s.faultInUseBooking(ctx, tx, b, in); err != nil {
 					return err
 				}
-				if b.PaidCents-b.RefundedCents > 0 {
-					amt := b.PaidCents - b.RefundedCents
-					if _, err := tx.Exec(ctx,
-						`insert into payments(booking_id,kind,amount_cents,method,status,transaction_no,reason,created_source,created_by)
-						 values($1,'refund',$2,'mock','succeeded',$3,$4,'operator',$5)`,
-						b.ID, amt, fmt.Sprintf("RF%d-%06d", b.ID, random6()),
-						"场地维护锁定，场馆原因全额退款", in.StaffID); err != nil {
-						return err
-					}
-					if _, err := tx.Exec(ctx,
-						`update bookings set refunded_cents=$2 where id=$1`, b.ID, b.PaidCents); err != nil {
-						return err
-					}
-				}
-				if _, err := tx.Exec(ctx,
-					`insert into disputes(booking_id,opened_by,auto_opened,status,issue,created_at)
-					 values($1,$2,false,'open',$3,now()) on conflict (booking_id) do nothing`,
-					b.ID, in.StaffID, "场地临时维护："+in.Reason); err != nil {
+				res.AutoFaulted = append(res.AutoFaulted, b.ID)
+			default: // paid / warming：预约开始前 -> 生成换场方案
+				offer, err := s.createRelocationOffer(ctx, tx, m, b, in.StaffID)
+				if err != nil {
 					return err
 				}
-				if b.LightOffAt == nil {
-					if _, err := tx.Exec(ctx,
-						`insert into light_records(booking_id,court_id,action,command_source,success,detail,occurred_at)
-						 values($1,$2,'off','operator',true,'maintenance lock',$3)`,
-						b.ID, b.CourtID, s.now(ctx)); err != nil {
-						return err
-					}
-				}
+				res.Offers = append(res.Offers, offer)
 			}
 			if err := emitEvent(ctx, tx, "booking.affected_by_maintenance", "operator", &b.ID, &b.VenueID, &b.CourtID, &in.StaffID,
 				map[string]any{"maintenance_id": m.ID, "old_status": b.Status}); err != nil {
@@ -111,32 +108,118 @@ func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*
 		}
 		return emitEvent(ctx, tx, "maintenance.created", "operator", nil, &in.VenueID, &in.CourtID, &in.StaffID,
 			map[string]any{"maintenance_id": m.ID, "affected": len(affected),
+				"offers": len(res.Offers), "auto_faulted": len(res.AutoFaulted), "expired": len(res.Expired),
 				"start": in.StartTime, "end": in.EndTime, "reason": in.Reason})
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &m, nil
+	return res, nil
 }
 
-func (s *Service) ReleaseMaintenance(ctx context.Context, id, staffID int64) error {
-	return inTx(ctx, s.pool(), func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx,
-			`update maintenance_windows set status='released',released_by=$2,released_at=now()
-			 where id=$1 and status='active'`, id, staffID)
+// faultInUseBooking 进行中场次遇维护：场馆原因全额退款 + 争议单 + 关灯留痕
+func (s *Service) faultInUseBooking(ctx context.Context, tx pgx.Tx, b *store.Booking, in MaintenanceInput) error {
+	if _, err := tx.Exec(ctx,
+		`update bookings set status='venue_fault',verdict='venue_fault',judge_source='maintenance',
+		 maintenance_reason=$2, judged_at=now(),version=version+1,updated_at=now() where id=$1`, b.ID, in.Reason); err != nil {
+		return err
+	}
+	if b.PaidCents-b.RefundedCents > 0 {
+		amt := b.PaidCents - b.RefundedCents
+		if _, err := tx.Exec(ctx,
+			`insert into payments(booking_id,kind,amount_cents,method,status,transaction_no,reason,created_source,created_by)
+			 values($1,'refund',$2,'mock','succeeded',$3,$4,'operator',$5)`,
+			b.ID, amt, fmt.Sprintf("RF%d-%06d", b.ID, random6()),
+			"场地维护锁定，场馆原因全额退款", in.StaffID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`update bookings set refunded_cents=$2 where id=$1`, b.ID, b.PaidCents); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`insert into disputes(booking_id,opened_by,auto_opened,status,issue,created_at)
+		 values($1,$2,false,'open',$3,now()) on conflict (booking_id) do nothing`,
+		b.ID, in.StaffID, "场地临时维护："+in.Reason); err != nil {
+		return err
+	}
+	if b.LightOffAt == nil {
+		if _, err := tx.Exec(ctx,
+			`insert into light_records(booking_id,court_id,action,command_source,success,detail,occurred_at)
+			 values($1,$2,'off','operator',true,'maintenance lock',$3)`,
+			b.ID, b.CourtID, s.now(ctx)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FinishMaintenance 运营上报维护完工 -> 待前台验收（acceptance_pending）。验收前场地不重新开放。
+func (s *Service) FinishMaintenance(ctx context.Context, id, staffID int64) (*store.Maintenance, error) {
+	var m *store.Maintenance
+	err := inTx(ctx, s.pool(), func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx,
+			`update maintenance_windows set status='acceptance_pending',finished_by=$2,finished_at=now()
+			 where id=$1 and status='active'
+			 returning `+maintenanceColumns, id, staffID)
+		var err error
+		m, err = scanMaintenance(row)
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return ce("NOT_FOUND", "维护记录不存在或已释放", ErrNotFound)
+		if m == nil {
+			return ce("NOT_FOUND", "维护记录不存在或不在进行中", ErrNotFound)
 		}
-		var venueID, courtID int64
-		if err := tx.QueryRow(ctx, `select venue_id,court_id from maintenance_windows where id=$1`, id).Scan(&venueID, &courtID); err != nil {
+		return emitEvent(ctx, tx, "maintenance.finished", "operator", nil, &m.VenueID, &m.CourtID, &staffID,
+			map[string]any{"maintenance_id": id, "note": "维护完工，待前台验收"})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// AcceptMaintenance 前台验收。pass=true 验收通过 -> released，场地重新开放预约；
+// pass=false 验收不通过 -> 回到 active 继续维护（场地保持锁定）。
+func (s *Service) AcceptMaintenance(ctx context.Context, id, staffID int64, pass bool, note string) (*store.Maintenance, error) {
+	var m *store.Maintenance
+	err := inTx(ctx, s.pool(), func(tx pgx.Tx) error {
+		var row pgx.Row
+		if pass {
+			row = tx.QueryRow(ctx,
+				`update maintenance_windows
+				 set status='released',accepted_by=$2,accepted_at=now(),acceptance_note=$3,
+				     released_by=$2,released_at=now()
+				 where id=$1 and status='acceptance_pending'
+				 returning `+maintenanceColumns, id, staffID, note)
+		} else {
+			row = tx.QueryRow(ctx,
+				`update maintenance_windows
+				 set status='active',accepted_by=$2,accepted_at=now(),acceptance_note=$3,
+				     finished_by=null,finished_at=null
+				 where id=$1 and status='acceptance_pending'
+				 returning `+maintenanceColumns, id, staffID, note)
+		}
+		var err error
+		m, err = scanMaintenance(row)
+		if err != nil {
 			return err
 		}
-		return emitEvent(ctx, tx, "maintenance.released", "operator", nil, &venueID, &courtID, &staffID,
-			map[string]any{"maintenance_id": id})
+		if m == nil {
+			return ce("NOT_FOUND", "维护记录不存在或未处于待验收状态", ErrNotFound)
+		}
+		eventType := "maintenance.accepted"
+		if !pass {
+			eventType = "maintenance.acceptance_failed"
+		}
+		return emitEvent(ctx, tx, eventType, "front", nil, &m.VenueID, &m.CourtID, &staffID,
+			map[string]any{"maintenance_id": id, "pass": pass, "note": note})
 	})
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // ---------- 临时加场 ----------
@@ -373,15 +456,16 @@ func int64Ptr(i int64) *int64 { return &i }
 // ---------- 查询：争议全景 ----------
 
 type DisputeDetail struct {
-	Dispute      *store.Dispute      `json:"dispute"`
-	Booking      *store.Booking      `json:"booking"`
-	Payments     []store.Payment     `json:"payments"`
-	GateRecords  []store.GateRecord  `json:"gate_records"`
-	LightRecords []store.LightRecord `json:"light_records"`
-	FrontRecords []store.FrontRecord `json:"front_records"`
-	Events       []store.Event       `json:"events"`
-	Maintenance  []store.Maintenance `json:"maintenance"`
-	Verdict      *VerdictEvidence    `json:"verdict"`
+	Dispute      *store.Dispute          `json:"dispute"`
+	Booking      *store.Booking          `json:"booking"`
+	Payments     []store.Payment         `json:"payments"`
+	GateRecords  []store.GateRecord      `json:"gate_records"`
+	LightRecords []store.LightRecord     `json:"light_records"`
+	FrontRecords []store.FrontRecord     `json:"front_records"`
+	Events       []store.Event           `json:"events"`
+	Maintenance  []store.Maintenance     `json:"maintenance"`
+	Relocations  []store.RelocationOffer `json:"relocations"`
+	Verdict      *VerdictEvidence        `json:"verdict"`
 }
 
 func (s *Service) GetDispute(ctx context.Context, id int64) (*store.Dispute, error) {
@@ -549,19 +633,32 @@ func (s *Service) BookingTimeline(ctx context.Context, bookingID int64) (*Disput
 	rows.Close()
 
 	rows, err = pool.Query(ctx,
-		`select id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at
-		 from maintenance_windows where court_id=$1 order by id`, b.CourtID)
+		`select `+maintenanceColumns+` from maintenance_windows where court_id=$1 order by id`, b.CourtID)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var m store.Maintenance
-		if err := rows.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason, &m.Status,
-			&m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt, &m.CreatedAt); err != nil {
+		m, err := scanMaintenance(rows)
+		if err != nil {
 			rows.Close()
 			return nil, err
 		}
-		d.Maintenance = append(d.Maintenance, m)
+		d.Maintenance = append(d.Maintenance, *m)
+	}
+	rows.Close()
+
+	rows, err = pool.Query(ctx,
+		`select `+offerColumns+` from relocation_offers where booking_id=$1 order by id`, bookingID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		o, err := scanOffer(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		d.Relocations = append(d.Relocations, *o)
 	}
 	rows.Close()
 

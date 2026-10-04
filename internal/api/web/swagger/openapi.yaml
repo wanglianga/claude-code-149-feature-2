@@ -5,8 +5,10 @@ info:
   description: >
     后端服务（Go + PostgreSQL + Redis）。覆盖预约下单、支付与超时释放、闸机放行、
     灯控预热/开灯/关灯、前台签到、延时与拼场超员计费、退订规则、爽约/迟到/场馆原因裁决、
-    场地维护锁定、临时加场、会员权益抵扣、客服争议处理。所有状态变化写入统一事件日志，
-    客服可通过 timeline 接口查看预约、支付、闸机、灯控、前台操作与维护记录。
+    场地维护锁定与临时换场（用户可换场/顺延/退款，高价差价场馆承担，闸机灯控权限同步新场地，
+    维护完工需前台验收才重新开放）、临时加场、会员权益抵扣、客服争议处理。
+    所有状态变化写入统一事件日志，客服可通过 timeline 接口查看预约、支付、闸机、灯控、
+    前台操作与维护记录。
 
 
 servers:
@@ -166,6 +168,23 @@ paths:
       summary: 我的预约
       responses:
         '200': { description: OK }
+  /me/relocation-offers:
+    get:
+      tags: [bookings]
+      summary: 我的换场方案（场地维护触发，待我确认）
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: ['', pending, accepted_relocate, accepted_postpone, refunded, expired] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offers:
+                    type: array
+                    items: { $ref: '#/components/schemas/RelocationOffer' }
   /bookings/{id}:
     get:
       tags: [bookings]
@@ -368,6 +387,51 @@ paths:
         - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
       responses:
         '200': { description: OK }
+  /bookings/{id}/relocation-offer:
+    get:
+      tags: [bookings]
+      summary: 查看该订单的换场方案（候选场地与差价）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RelocationOffer' }
+        '404': { description: 该订单没有换场方案 }
+  /bookings/{id}/relocation-offer/accept:
+    post:
+      tags: [bookings]
+      summary: >
+        用户确认换场方案：relocate 换场（换到更高价场地时差价由场馆承担，
+        闸机/灯控权限同步到新场地）/ postpone 顺延（同时长新时段）/ refund 全额退款
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [relocate, postpone, refund] }
+                court_id: { type: integer, format: int64, description: relocate 必选，须在候选场地中 }
+                start_time: { type: string, format: date-time, description: postpone 必选 }
+                end_time: { type: string, format: date-time, description: postpone 必选 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offer: { $ref: '#/components/schemas/RelocationOffer' }
+                  old_booking: { $ref: '#/components/schemas/Booking' }
+                  new_booking: { $ref: '#/components/schemas/Booking' }
+        '409': { description: 方案已处理 / 目标场地刚被抢占 }
 
   /devices/gate/scan:
     post:
@@ -425,7 +489,10 @@ paths:
         '200': { description: OK }
     post:
       tags: [operator]
-      summary: 创建维护锁定（覆盖订单：held 释放，paid 等自动场馆原因全额退款并开争议单）
+      summary: >
+        创建维护锁定（如开场前发现地胶起翘）。覆盖订单：held 释放；in_use 直接场馆原因全额退款；
+        paid/warming 生成换场方案（relocation_offers，含同时间可用场地与差价），
+        用户可换场/顺延/退款；已扫码进旧场地的订单生成清场提醒并把维护原因写入订单
       requestBody:
         required: true
         content:
@@ -438,17 +505,96 @@ paths:
                 court_id: { type: integer, format: int64 }
                 start_time: { type: string, format: date-time }
                 end_time: { type: string, format: date-time }
-                reason: { type: string }
+                reason: { type: string, example: 地胶起翘 }
       responses:
-        '201': { description: OK }
-  /operator/maintenances/{id}/release:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  maintenance: { $ref: '#/components/schemas/Maintenance' }
+                  offers:
+                    type: array
+                    items: { $ref: '#/components/schemas/RelocationOffer' }
+                  auto_faulted:
+                    type: array
+                    items: { type: integer, format: int64 }
+                  expired:
+                    type: array
+                    items: { type: integer, format: int64 }
+  /operator/maintenances/{id}/finish:
     post:
       tags: [operator]
-      summary: 提前解除维护
+      summary: 维护完工上报（operator）-> 待前台验收，验收前场地不重新开放
       parameters:
         - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
       responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Maintenance' }
+  /operator/maintenances/{id}/accept:
+    post:
+      tags: [operator]
+      summary: 前台验收（front）：pass=true 验收通过场地重新开放；pass=false 验收不通过回到维护中
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pass: { type: boolean, default: true }
+                note: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Maintenance' }
+  /operator/relocation-offers:
+    get:
+      tags: [operator]
+      summary: 换场方案列表（员工）
+      parameters:
+        - { name: venue_id, in: query, schema: { type: integer, format: int64 } }
+        - { name: status, in: query, schema: { type: string, enum: ['', pending, accepted_relocate, accepted_postpone, refunded, expired] } }
+      responses:
         '200': { description: OK }
+  /front/notifications:
+    get:
+      tags: [operator]
+      summary: 前台/运营待办通知（旧场地清场提醒等）
+      parameters:
+        - { name: venue_id, in: query, schema: { type: integer, format: int64 } }
+        - { name: status, in: query, schema: { type: string, enum: ['', pending, done] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items: { $ref: '#/components/schemas/OpsNotification' }
+  /front/notifications/{id}/ack:
+    post:
+      tags: [operator]
+      summary: 前台确认处理通知（如旧场地清场完成）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpsNotification' }
   /operator/extra-slots:
     post:
       tags: [operator]
@@ -597,7 +743,7 @@ components:
         late_adjust_cents: { type: integer, format: int64 }
         status:
           type: string
-          enum: [held, paid, warming, in_use, completed, cancelled, expired, no_show, venue_fault, disputed]
+          enum: [held, paid, warming, in_use, completed, cancelled, expired, no_show, venue_fault, disputed, relocated]
         entry_code: { type: string }
         expires_at: { type: string, format: date-time, nullable: true }
         paid_at: { type: string, format: date-time, nullable: true }
@@ -620,5 +766,66 @@ components:
           enum: [on_time, late, no_show, venue_fault, ambiguous, excused]
         judge_source: { type: string, nullable: true }
         note: { type: string }
+        maintenance_reason: { type: string, description: 场馆维护原因（换场/场馆原因时写入，防误判用户占场） }
+        superseded_by: { type: integer, format: int64, nullable: true, description: 换场/顺延后的新订单 ID }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+    Maintenance:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        venue_id: { type: integer, format: int64 }
+        court_id: { type: integer, format: int64 }
+        start_time: { type: string, format: date-time }
+        end_time: { type: string, format: date-time }
+        reason: { type: string }
+        status:
+          type: string
+          enum: [active, acceptance_pending, released]
+          description: active 维护中 -> acceptance_pending 已完工待前台验收 -> released 验收通过重新开放
+        finished_at: { type: string, format: date-time, nullable: true }
+        accepted_by: { type: integer, format: int64, nullable: true }
+        accepted_at: { type: string, format: date-time, nullable: true }
+        acceptance_note: { type: string }
+        created_at: { type: string, format: date-time }
+    RelocationCandidate:
+      type: object
+      properties:
+        court_id: { type: integer, format: int64 }
+        court_no: { type: string }
+        capacity: { type: integer }
+        price_cents_per_hour: { type: integer, format: int64 }
+        price_diff_cents: { type: integer, format: int64, description: 相对原订单场地费差价；>0 时由场馆承担 }
+    RelocationOffer:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        booking_id: { type: integer, format: int64 }
+        maintenance_id: { type: integer, format: int64 }
+        venue_id: { type: integer, format: int64 }
+        old_court_id: { type: integer, format: int64 }
+        status:
+          type: string
+          enum: [pending, accepted_relocate, accepted_postpone, refunded, expired]
+        candidates:
+          type: array
+          items: { $ref: '#/components/schemas/RelocationCandidate' }
+        clearance_needed: { type: boolean, description: 用户已扫码进旧场地，需前台清场 }
+        new_booking_id: { type: integer, format: int64, nullable: true }
+        venue_subsidy_cents: { type: integer, format: int64, description: 换到更高价场地时场馆承担的差价 }
+        reason: { type: string }
+        decided_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    OpsNotification:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        venue_id: { type: integer, format: int64 }
+        court_id: { type: integer, format: int64, nullable: true }
+        booking_id: { type: integer, format: int64, nullable: true }
+        type: { type: string, enum: [clearance_reminder] }
+        message: { type: string }
+        status: { type: string, enum: [pending, done] }
+        created_at: { type: string, format: date-time }
+        acked_by: { type: integer, format: int64, nullable: true }
+        acked_at: { type: string, format: date-time, nullable: true }

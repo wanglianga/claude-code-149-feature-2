@@ -269,6 +269,24 @@ func (s *Server) handleMyBookings(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"bookings": bs})
 }
 
+// GET /api/v1/me/relocation-offers?status=pending 会员自己的换场方案
+func (s *Server) handleMyRelocationOffers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	c, ok := s.requireMember(w, r)
+	if !ok {
+		return
+	}
+	list, err := s.Svc.ListMemberRelocationOffers(r.Context(), c.Sub, r.URL.Query().Get("status"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"offers": list})
+}
+
 // 校验会员是否为订单所有者；员工直接放行
 func (s *Server) loadOwnedBooking(w http.ResponseWriter, r *http.Request, id int64) (*auth.Claims, bool) {
 	c, ok := s.claims(r)
@@ -338,6 +356,16 @@ func (s *Server) dispatchBooking(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeOK(w, v)
+		case "relocation-offer":
+			if _, ok := s.loadOwnedBooking(w, r, id); !ok {
+				return
+			}
+			o, err := s.Svc.GetRelocationOfferForBooking(r.Context(), id)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			writeOK(w, o)
 		default:
 			http.NotFound(w, r)
 		}
@@ -586,6 +614,46 @@ func (s *Server) dispatchBooking(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 201, rr)
+
+	case "relocation-offer/accept":
+		// 用户确认换场方案：换场（差价场馆承担）/ 顺延 / 退款
+		c, ok := s.requireMember(w, r)
+		if !ok {
+			return
+		}
+		var req struct {
+			Action    string `json:"action"`
+			CourtID   int64  `json:"court_id"`
+			StartTime string `json:"start_time"`
+			EndTime   string `json:"end_time"`
+		}
+		if err := decode(r, &req); err != nil {
+			writeErr(w, err)
+			return
+		}
+		dec := service.RelocationDecision{Action: req.Action, CourtID: req.CourtID, MemberID: c.Sub}
+		if req.StartTime != "" {
+			st, err := parseTime(req.StartTime)
+			if err != nil {
+				writeJSON(w, 400, map[string]any{"error": map[string]string{"code": "BAD_TIME", "message": err.Error()}})
+				return
+			}
+			dec.StartTime = st
+		}
+		if req.EndTime != "" {
+			en, err := parseTime(req.EndTime)
+			if err != nil {
+				writeJSON(w, 400, map[string]any{"error": map[string]string{"code": "BAD_TIME", "message": err.Error()}})
+				return
+			}
+			dec.EndTime = en
+		}
+		res, err := s.Svc.AcceptRelocation(r.Context(), id, dec)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeOK(w, res)
 
 	case "timeline":
 		if _, ok := s.requireStaff(w, r); !ok {

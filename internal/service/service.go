@@ -84,13 +84,28 @@ func (s *Service) loadVenue(ctx context.Context, q pgx.Tx, id int64) (*store.Ven
 
 func (s *Service) loadCourt(ctx context.Context, q pgx.Tx, id int64) (*store.Court, error) {
 	row := q.QueryRow(ctx,
-		`select id, venue_id, court_no, coalesce(capacity,0), status from courts where id=$1`, id)
+		`select id, venue_id, court_no, coalesce(capacity,0), status, price_cents_per_hour from courts where id=$1`, id)
 	var c store.Court
-	err := row.Scan(&c.ID, &c.VenueID, &c.CourtNo, &c.Capacity, &c.Status)
+	err := row.Scan(&c.ID, &c.VenueID, &c.CourtNo, &c.Capacity, &c.Status, &c.PriceCentsPerHour)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return &c, err
+}
+
+// effectiveRate 场地实际 hourly 价：单场地价格覆盖优先，否则用场馆统一价
+func effectiveRate(venue *store.Venue, court *store.Court) int64 {
+	if court != nil && court.PriceCentsPerHour != nil {
+		return *court.PriceCentsPerHour
+	}
+	return venue.PriceCentsPerHour
+}
+
+// venueWithRate 返回替换 hourly 价后的场馆副本（计费引擎复用，其余费率不变）
+func venueWithRate(venue *store.Venue, rate int64) *store.Venue {
+	v := *venue
+	v.PriceCentsPerHour = rate
+	return &v
 }
 
 func (s *Service) getMemberPolicy(ctx context.Context, q pgx.Tx, venueID int64, memberType string) (store.MemberPolicy, error) {
@@ -136,7 +151,7 @@ const bookingColumns = `id,booking_no,venue_id,court_id,member_id,member_type_sn
 	first_gate_at,gate_waiting_at,front_checkin_at,first_presence_at,
 	warmup_at,light_on_at,light_off_at,effective_start,actual_end,
 	overtime_minutes,late_start_minutes,comp_bonus_minutes,overlimit_persons,
-	verdict,judged_at,judge_source,note,created_source,version,created_at,updated_at`
+	verdict,judged_at,judge_source,note,maintenance_reason,superseded_by,created_source,version,created_at,updated_at`
 
 func scanBooking(row pgx.Row) (*store.Booking, error) {
 	var b store.Booking
@@ -151,7 +166,8 @@ func scanBooking(row pgx.Row) (*store.Booking, error) {
 		&b.FirstGateAt, &b.GateWaitingAt, &b.FrontCheckinAt, &b.FirstPresenceAt,
 		&b.WarmupAt, &b.LightOnAt, &b.LightOffAt, &b.EffectiveStart, &b.ActualEnd,
 		&b.OvertimeMinutes, &b.LateStartMinutes, &b.CompBonusMinutes, &b.OverlimitPersons,
-		&b.Verdict, &b.JudgedAt, &b.JudgeSource, &b.Note, &b.CreatedSource, &b.Version, &b.CreatedAt, &b.UpdatedAt)
+		&b.Verdict, &b.JudgedAt, &b.JudgeSource, &b.Note, &b.MaintenanceReason, &b.SupersededBy,
+		&b.CreatedSource, &b.Version, &b.CreatedAt, &b.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -243,16 +259,15 @@ func loadExtraSlots(ctx context.Context, q pgx.Tx, venueID, courtID int64, day s
 	return out, rows.Err()
 }
 
-// activeMaintenanceNow 返回 t 时刻生效中的维护
-func activeMaintenanceAt(ctx context.Context, q pgx.Tx, courtID int64, t time.Time) (*store.Maintenance, error) {
-	row := q.QueryRow(ctx,
-		`select id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at
-		 from maintenance_windows
-		 where court_id=$1 and status='active' and tstzrange(start_time,end_time,'[)') @> $2::timestamptz
-		 limit 1`, courtID, t)
+// maintenanceColumns 维护窗口全字段读取顺序，须与 scanMaintenance 一致
+const maintenanceColumns = `id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,
+	finished_by,finished_at,accepted_by,accepted_at,acceptance_note,created_at`
+
+func scanMaintenance(row pgx.Row) (*store.Maintenance, error) {
 	var m store.Maintenance
 	err := row.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason, &m.Status,
-		&m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt, &m.CreatedAt)
+		&m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt,
+		&m.FinishedBy, &m.FinishedAt, &m.AcceptedBy, &m.AcceptedAt, &m.AcceptanceNote, &m.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -260,6 +275,38 @@ func activeMaintenanceAt(ctx context.Context, q pgx.Tx, courtID int64, t time.Ti
 		return nil, err
 	}
 	return &m, nil
+}
+
+// maintenanceBlockSQL 场地对预约时段 [s,e) 的维护阻断规则（$1=court_id, $2=s, $3=e）：
+//   - active：窗口与预约时段重叠即阻断；
+//   - acceptance_pending：维护已报完工但前台未验收，验收前整片场地不重新开放，
+//     阻断所有不完全早于维护开始时间的时段。
+const maintenanceBlockSQL = `select exists(select 1 from maintenance_windows
+	where court_id=$1 and status in ('active','acceptance_pending')
+	and (
+	  tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)')
+	  or (status='acceptance_pending' and start_time < $3)
+	))`
+
+// courtBlockedByMaintenance 判断 court 在 [s,e) 是否被维护/待验收阻断
+func courtBlockedByMaintenance(ctx context.Context, q pgx.Tx, courtID int64, s, e time.Time) (bool, error) {
+	var blocked bool
+	if err := q.QueryRow(ctx, maintenanceBlockSQL, courtID, s, e).Scan(&blocked); err != nil {
+		return false, err
+	}
+	return blocked, nil
+}
+
+// activeMaintenanceAt 返回 t 时刻使场地不可用的维护（窗口内 active，或未验收的 acceptance_pending）
+func activeMaintenanceAt(ctx context.Context, q pgx.Tx, courtID int64, t time.Time) (*store.Maintenance, error) {
+	row := q.QueryRow(ctx,
+		`select `+maintenanceColumns+` from maintenance_windows
+		 where court_id=$1 and (
+		   (status='active' and tstzrange(start_time,end_time,'[)') @> $2::timestamptz)
+		   or (status='acceptance_pending' and start_time <= $2::timestamptz)
+		 )
+		 order by id desc limit 1`, courtID, t)
+	return scanMaintenance(row)
 }
 
 func fmtCents(c int64) string { return fmt.Sprintf("%.2f 元", float64(c)/100) }
