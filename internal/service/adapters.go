@@ -19,8 +19,7 @@ func ResolutionInput(action string, refund int64, comp int, note string, staffID
 
 // ListMaintenance 列出（可按场馆过滤）维护记录
 func (s *Service) ListMaintenance(ctx context.Context, venueID int64) ([]store.Maintenance, error) {
-	q := `select id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at
-		from maintenance_windows`
+	q := `select ` + maintenanceColumns + ` from maintenance_windows`
 	args := []any{}
 	if venueID > 0 {
 		q += ` where venue_id=$1 order by start_time desc`
@@ -35,9 +34,8 @@ func (s *Service) ListMaintenance(ctx context.Context, venueID int64) ([]store.M
 	defer rows.Close()
 	var out []store.Maintenance
 	for rows.Next() {
-		var m store.Maintenance
-		if err := rows.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason, &m.Status,
-			&m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt, &m.CreatedAt); err != nil {
+		m, err := scanMaintenance(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, m)

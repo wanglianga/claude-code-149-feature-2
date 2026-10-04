@@ -290,7 +290,19 @@ func (s *Service) CreateBooking(ctx context.Context, in CreateBookingInput) (*Cr
 		if court.VenueID != venue.ID {
 			return ce("COURT_VENUE_MISMATCH", "场地不属于该场馆", ErrValidation)
 		}
+		// 维护中场地优先报维护锁定（courts.status 已置 maintenance 时仍以维护窗口为准）
 		if court.Status != "active" {
+			var blocked bool
+			if err := tx.QueryRow(ctx,
+				`select exists(select 1 from maintenance_windows
+				  where court_id=$1 and status in ('active','repair_done')
+				  and tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)'))`,
+				court.ID, in.StartTime, in.EndTime).Scan(&blocked); err != nil {
+				return err
+			}
+			if blocked {
+				return ce("MAINTENANCE", "场地在该时段处于维护锁定状态", ErrMaintenance)
+			}
 			return ce("COURT_INACTIVE", "场地当前不可预约", ErrMaintenance)
 		}
 
@@ -356,11 +368,11 @@ func (s *Service) CreateBooking(ctx context.Context, in CreateBookingInput) (*Cr
 			}
 		}
 
-		// 维护锁定（含边界）
+		// 维护锁定（含维修完工待验收：未验收前同样不可订）
 		var blocked bool
 		if err := tx.QueryRow(ctx,
 			`select exists(select 1 from maintenance_windows
-			  where court_id=$1 and status='active'
+			  where court_id=$1 and status in ('active','repair_done')
 			  and tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)'))`,
 			court.ID, in.StartTime, in.EndTime).Scan(&blocked); err != nil {
 			return err
@@ -394,7 +406,7 @@ func (s *Service) CreateBooking(ctx context.Context, in CreateBookingInput) (*Cr
 			in.ShuttleCount = 0
 		}
 		bd := quote(priceInput{
-			venue: venue, policy: policy, peakWindows: windows,
+			venue: venue, courtPriceCents: court.PriceCentsPerHour, policy: policy, peakWindows: windows,
 			start: in.StartTime, end: in.EndTime,
 			racketCount: in.RacketCount, shuttleCount: in.ShuttleCount,
 			availableBenefitM: avail,

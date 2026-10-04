@@ -34,6 +34,15 @@ func (s *Server) handleJobJudge(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"judged": n})
 }
 
+func (s *Server) handleJobRelocationTimeout(w http.ResponseWriter, r *http.Request) {
+	n, err := s.Svc.AutoResolvePendingRelocations(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"auto_resolved": n})
+}
+
 // 虚拟时钟：仅 ALLOW_TEST_CLOCK=1 时生效
 func (s *Server) handleClock(w http.ResponseWriter, r *http.Request) {
 	if !s.AllowClock {

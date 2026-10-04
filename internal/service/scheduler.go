@@ -302,7 +302,7 @@ func presenceEvidence(ctx context.Context, tx pgx.Tx, bookingID int64) (gateOK, 
 
 func venueSideEvidence(ctx context.Context, tx pgx.Tx, b *store.Booking) (maint, prevRun, hasRefund bool, err error) {
 	if err = tx.QueryRow(ctx,
-		`select exists(select 1 from maintenance_windows where court_id=$1 and status='active'
+		`select exists(select 1 from maintenance_windows where court_id=$1 and status in ('active','repair_done')
 		  and tstzrange(start_time,end_time,'[)') && tstzrange($2,$3,'[)'))`,
 		b.CourtID, b.StartTime, b.EndTime).Scan(&maint); err != nil {
 		return
@@ -324,6 +324,7 @@ func (s *Service) JudgeNoShows(ctx context.Context) (int, error) {
 	rows, err := s.pool().Query(ctx, `
 		select b.id from bookings b join venues v on v.id=b.venue_id
 		where b.verdict is null
+		  and b.status not in ('relocation_pending','moved','venue_fault')
 		  and (
 		    (b.status in ('paid','warming')
 		      and b.start_time + (v.noshow_judge_minutes::int * interval '1 minute') <= $1

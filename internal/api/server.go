@@ -174,6 +174,11 @@ func (s *Server) routes() {
 	m.HandleFunc("/api/v1/operator/maintenances/", s.dispatchMaintenance)
 	m.HandleFunc("/api/v1/operator/extra-slots", s.handleExtraSlots)
 	m.HandleFunc("/api/v1/operator/rules/cancellation", s.handleCancelRules)
+	m.HandleFunc("/api/v1/operator/courts/", s.dispatchCourtAdmin)
+
+	// 前台：旧场地清场提醒
+	m.HandleFunc("/api/v1/front/vacate-reminders", s.handleVacateReminders)
+	m.HandleFunc("/api/v1/front/vacate-reminders/", s.handleVacateClear)
 
 	// 客服端
 	m.HandleFunc("/api/v1/cs/disputes", s.handleDisputes)
@@ -183,6 +188,7 @@ func (s *Server) routes() {
 	m.HandleFunc("/internal/jobs/expire-unpaid", s.handleJobExpire)
 	m.HandleFunc("/internal/jobs/auto-light", s.handleJobAutoLight)
 	m.HandleFunc("/internal/jobs/judge-noshow", s.handleJobJudge)
+	m.HandleFunc("/internal/jobs/relocation-timeout", s.handleJobRelocationTimeout)
 
 	// 测试时钟
 	m.HandleFunc("/internal/clock", s.handleClock)

@@ -64,18 +64,14 @@ func (s *Server) handleMaintenances(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// /api/v1/operator/maintenances/{id}/release
+// /api/v1/operator/maintenances/{id}/release|repair-complete|verify
 func (s *Server) dispatchMaintenance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		return
 	}
-	c, ok := s.requireStaff(w, r, "operator")
-	if !ok {
-		return
-	}
 	parts := segs("/api/v1/operator/maintenances", r.URL.Path)
-	if len(parts) != 2 || parts[1] != "release" {
+	if len(parts) != 2 {
 		http.NotFound(w, r)
 		return
 	}
@@ -84,11 +80,57 @@ func (s *Server) dispatchMaintenance(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": map[string]string{"code": "BAD_ID", "message": "非法维护 ID"}})
 		return
 	}
-	if err := s.Svc.ReleaseMaintenance(r.Context(), id, c.Sub); err != nil {
-		writeErr(w, err)
-		return
+	switch parts[1] {
+	case "release":
+		c, ok := s.requireStaff(w, r, "operator")
+		if !ok {
+			return
+		}
+		if err := s.Svc.ReleaseMaintenance(r.Context(), id, c.Sub); err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeOK(w, map[string]string{"status": "released"})
+	case "repair-complete":
+		c, ok := s.requireStaff(w, r, "operator", "front")
+		if !ok {
+			return
+		}
+		m, err := s.Svc.CompleteRepair(r.Context(), id, c.Sub)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeOK(w, m)
+	case "verify":
+		c, ok := s.requireStaff(w, r, "front", "operator")
+		if !ok {
+			return
+		}
+		var req struct {
+			Passed *bool  `json:"passed"`
+			Pass   *bool  `json:"pass"`
+			Note   string `json:"note"`
+		}
+		if err := decode(r, &req); err != nil {
+			writeErr(w, err)
+			return
+		}
+		pass := false
+		if req.Passed != nil {
+			pass = *req.Passed
+		} else if req.Pass != nil {
+			pass = *req.Pass
+		}
+		m, err := s.Svc.VerifyMaintenance(r.Context(), id, c.Sub, pass, req.Note)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeOK(w, m)
+	default:
+		http.NotFound(w, r)
 	}
-	writeOK(w, map[string]string{"status": "released"})
 }
 
 // ---------- 临时加场 ----------

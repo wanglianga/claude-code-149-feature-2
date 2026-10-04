@@ -14,6 +14,7 @@ import (
 
 type priceInput struct {
 	venue             *store.Venue
+	courtPriceCents   int64 // 场地专属价（分/小时），0 时用场馆基础价（如 VIP 场地）
 	policy            store.MemberPolicy
 	peakWindows       []store.PeakWindow
 	start, end        time.Time
@@ -81,6 +82,9 @@ func clockHM(hhmm string) int {
 func quote(in priceInput) priceBreakdown {
 	out := priceBreakdown{DurationMinutes: int(in.end.Sub(in.start).Minutes())}
 	rateNormal := in.venue.PriceCentsPerHour
+	if in.courtPriceCents > 0 {
+		rateNormal = in.courtPriceCents // 场地差异化定价（换场差价计算的关键）
+	}
 	ratePeak := int64(math.Round(float64(rateNormal) * in.venue.PeakMultiplier))
 
 	for m := 0; m < out.DurationMinutes; m++ {
@@ -132,15 +136,18 @@ func quote(in priceInput) priceBreakdown {
 }
 
 // overtimeFee 延时费用：超出预约结束（已含补偿时长）的部分，按 15 分钟向上取整，
-// 用延时时刻的费率（可能命中高峰）乘延时系数。
-func overtimeFee(v *store.Venue, windows []store.PeakWindow, baseEnd, actualEnd time.Time) (int, int64) {
+// 用延时时刻的费率（可能命中高峰）乘延时系数。rateNormal 为场地平时费率（0 时取场馆基础价）。
+func overtimeFee(v *store.Venue, windows []store.PeakWindow, baseEnd, actualEnd time.Time, rateNormal int64) (int, int64) {
 	if !actualEnd.After(baseEnd) {
 		return 0, 0
+	}
+	if rateNormal <= 0 {
+		rateNormal = v.PriceCentsPerHour
 	}
 	rawMin := int(actualEnd.Sub(baseEnd).Minutes())
 	units := (rawMin + 14) / 15
 	billMin := units * 15
-	rate := v.PriceCentsPerHour
+	rate := rateNormal
 	if isPeakAt(windows, actualEnd.Add(-time.Minute)) {
 		rate = int64(math.Round(float64(rate) * v.PeakMultiplier))
 	}

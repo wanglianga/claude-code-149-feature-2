@@ -84,9 +84,9 @@ func (s *Service) loadVenue(ctx context.Context, q pgx.Tx, id int64) (*store.Ven
 
 func (s *Service) loadCourt(ctx context.Context, q pgx.Tx, id int64) (*store.Court, error) {
 	row := q.QueryRow(ctx,
-		`select id, venue_id, court_no, coalesce(capacity,0), status from courts where id=$1`, id)
+		`select id, venue_id, court_no, coalesce(capacity,0), status, coalesce(price_cents_per_hour,0) from courts where id=$1`, id)
 	var c store.Court
-	err := row.Scan(&c.ID, &c.VenueID, &c.CourtNo, &c.Capacity, &c.Status)
+	err := row.Scan(&c.ID, &c.VenueID, &c.CourtNo, &c.Capacity, &c.Status, &c.PriceCentsPerHour)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -136,7 +136,10 @@ const bookingColumns = `id,booking_no,venue_id,court_id,member_id,member_type_sn
 	first_gate_at,gate_waiting_at,front_checkin_at,first_presence_at,
 	warmup_at,light_on_at,light_off_at,effective_start,actual_end,
 	overtime_minutes,late_start_minutes,comp_bonus_minutes,overlimit_persons,
-	verdict,judged_at,judge_source,note,created_source,version,created_at,updated_at`
+	verdict,judged_at,judge_source,note,created_source,
+	relocation_status,relocation_maintenance_id,original_court_id,
+	relocated_from_booking_id,relocated_to_booking_id,relocation_due_at,venue_borne_cents,vacate_reminded_at,
+	version,created_at,updated_at`
 
 func scanBooking(row pgx.Row) (*store.Booking, error) {
 	var b store.Booking
@@ -151,7 +154,10 @@ func scanBooking(row pgx.Row) (*store.Booking, error) {
 		&b.FirstGateAt, &b.GateWaitingAt, &b.FrontCheckinAt, &b.FirstPresenceAt,
 		&b.WarmupAt, &b.LightOnAt, &b.LightOffAt, &b.EffectiveStart, &b.ActualEnd,
 		&b.OvertimeMinutes, &b.LateStartMinutes, &b.CompBonusMinutes, &b.OverlimitPersons,
-		&b.Verdict, &b.JudgedAt, &b.JudgeSource, &b.Note, &b.CreatedSource, &b.Version, &b.CreatedAt, &b.UpdatedAt)
+		&b.Verdict, &b.JudgedAt, &b.JudgeSource, &b.Note, &b.CreatedSource,
+		&b.RelocationStatus, &b.RelocationMaintenanceID, &b.OriginalCourtID,
+		&b.RelocatedFromBookingID, &b.RelocatedToBookingID, &b.RelocationDueAt, &b.VenueBorneCents, &b.VacateRemindedAt,
+		&b.Version, &b.CreatedAt, &b.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -243,12 +249,13 @@ func loadExtraSlots(ctx context.Context, q pgx.Tx, venueID, courtID int64, day s
 	return out, rows.Err()
 }
 
-// activeMaintenanceNow 返回 t 时刻生效中的维护
+// activeMaintenanceNow 返回 t 时刻生效中的维护（维修完工待验收仍视为锁定）
 func activeMaintenanceAt(ctx context.Context, q pgx.Tx, courtID int64, t time.Time) (*store.Maintenance, error) {
 	row := q.QueryRow(ctx,
-		`select id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at
+		`select `+maintenanceColumns+`
 		 from maintenance_windows
-		 where court_id=$1 and status='active' and tstzrange(start_time,end_time,'[)') @> $2::timestamptz
+		 where court_id=$1 and status in ('active','repair_done')
+		   and tstzrange(start_time,end_time,'[)') @> $2::timestamptz
 		 limit 1`, courtID, t)
 	var m store.Maintenance
 	err := row.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason, &m.Status,

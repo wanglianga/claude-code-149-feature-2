@@ -65,6 +65,20 @@ func (s *Service) GateScan(ctx context.Context, entryCode, deviceID string) (*Ga
 		case "completed":
 			res.Result, res.Reason = "denied", "订单已完成"
 			return record("denied", res.Reason)
+		case "moved":
+			res.Result, res.Reason = "denied", "订单已因场地维护换场，请使用新场地的新入场码"
+			if err := record("denied", res.Reason); err != nil {
+				return err
+			}
+			return emitEvent(ctx, tx, "gate.denied", "gate", &b.ID, &b.VenueID, &b.CourtID, nil,
+				map[string]any{"reason": res.Reason, "new_booking_id": b.RelocatedToBookingID, "device": deviceID})
+		case "relocation_pending":
+			res.Result, res.Reason = "denied", "场地临时维护，请先确认换场/顺延/退款方案后凭新入场码入场"
+			if err := record("denied", res.Reason); err != nil {
+				return err
+			}
+			return emitEvent(ctx, tx, "gate.denied", "gate", &b.ID, &b.VenueID, &b.CourtID, nil,
+				map[string]any{"reason": res.Reason, "maintenance_id": b.RelocationMaintenanceID, "device": deviceID})
 		}
 
 		windowStart := b.StartTime.Add(-time.Duration(venue.CheckinWindowMinutes) * time.Minute)
@@ -340,12 +354,16 @@ func (s *Service) EndSession(ctx context.Context, bookingID int64, source string
 		if err != nil {
 			return err
 		}
+		court, err := s.loadCourt(ctx, tx, b.CourtID)
+		if err != nil {
+			return err
+		}
 		windows, err := s.peakWindows(ctx, tx, b.VenueID)
 		if err != nil {
 			return err
 		}
 		allowedEnd := b.EndTime.Add(time.Duration(b.CompBonusMinutes) * time.Minute)
-		otMin, otFee := overtimeFee(venue, windows, allowedEnd, now)
+		otMin, otFee := overtimeFee(venue, windows, allowedEnd, now, court.PriceCentsPerHour)
 		if otFee < 0 {
 			otFee = 0
 		}

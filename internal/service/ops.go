@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ---------- 场地维护锁定 ----------
+// ---------- 场地维护锁定 / 临时换场 ----------
 
 type MaintenanceInput struct {
 	VenueID   int64
@@ -21,26 +21,30 @@ type MaintenanceInput struct {
 	StaffID   int64
 }
 
-// CreateMaintenance 运营锁定场地维护。若覆盖已预约订单：
-// paid/warming/in_use 的订单不阻塞锁定，但自动标记 venue_fault 并全额退款、开争议单；
-// held 订单直接过期释放。
+// CreateMaintenance 运营锁定场地维护（如预约开始前发现地胶起翘）。若覆盖已预约订单：
+// held 订单直接过期释放；paid/warming/in_use 订单进入 relocation_pending（临时换场流程），
+// 由用户选择换场/顺延/退款；逾期未选择由后台任务按场馆原因全额退款。
 func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*store.Maintenance, error) {
 	in.StartTime = in.StartTime.UTC().Truncate(time.Minute)
 	in.EndTime = in.EndTime.UTC().Truncate(time.Minute)
 	if !in.EndTime.After(in.StartTime) {
 		return nil, ce("BAD_TIME", "维护结束时间必须晚于开始时间", ErrValidation)
 	}
+	now := s.now(ctx)
 	var m store.Maintenance
 	err := inTx(ctx, s.pool(), func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx,
 			`insert into maintenance_windows(venue_id,court_id,start_time,end_time,reason,created_by)
 			 values($1,$2,$3,$4,$5,$6)
-			 returning id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at`,
+			 returning `+maintenanceColumns,
 			in.VenueID, in.CourtID, in.StartTime, in.EndTime, in.Reason, in.StaffID)
-		if err := row.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason,
-			&m.Status, &m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt, &m.CreatedAt); err != nil {
+		var err error
+		m, err = scanMaintenance(row)
+		if err != nil {
 			return err
 		}
+		// 场地锁定以 maintenance_windows 为准（active/repair_done 均阻止预约与闸机），
+		// 不改 courts.status，避免多条维护/验收交错时场地状态难以恢复。
 		// 处理受影响订单
 		rows, err := tx.Query(ctx,
 			`select `+bookingColumns+` from bookings
@@ -68,44 +72,44 @@ func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*
 				if err := releaseReservedBenefit(ctx, tx, b); err != nil {
 					return err
 				}
-			} else {
-				// paid / warming / in_use -> venue_fault 全额退款
-				if _, err := tx.Exec(ctx,
-					`update bookings set status='venue_fault',verdict='venue_fault',judge_source='maintenance',
-					 judged_at=now(),version=version+1,updated_at=now() where id=$1`, b.ID); err != nil {
+				if err := emitEvent(ctx, tx, "booking.affected_by_maintenance", "operator", &b.ID, &b.VenueID, &b.CourtID, &in.StaffID,
+					map[string]any{"maintenance_id": m.ID, "old_status": b.Status, "handling": "expired"}); err != nil {
 					return err
 				}
-				if b.PaidCents-b.RefundedCents > 0 {
-					amt := b.PaidCents - b.RefundedCents
-					if _, err := tx.Exec(ctx,
-						`insert into payments(booking_id,kind,amount_cents,method,status,transaction_no,reason,created_source,created_by)
-						 values($1,'refund',$2,'mock','succeeded',$3,$4,'operator',$5)`,
-						b.ID, amt, fmt.Sprintf("RF%d-%06d", b.ID, random6()),
-						"场地维护锁定，场馆原因全额退款", in.StaffID); err != nil {
-						return err
-					}
-					if _, err := tx.Exec(ctx,
-						`update bookings set refunded_cents=$2 where id=$1`, b.ID, b.PaidCents); err != nil {
-						return err
-					}
-				}
+				continue
+			}
+			// paid / warming / in_use -> relocation_pending：等待用户选择换场/顺延/退款
+			// 换场方案确认截止：开场前 10 分钟；若锁定时距开场不足 10 分钟，则给 5 分钟处理宽限
+			due := b.StartTime.Add(-10 * time.Minute)
+			if !due.After(now) {
+				due = now.Add(5 * time.Minute)
+			}
+			if _, err := tx.Exec(ctx,
+				`update bookings set status='relocation_pending',
+				 relocation_status='pending',relocation_maintenance_id=$2,original_court_id=court_id,
+				 relocation_due_at=$3,
+				 note=case when note='' then $4 else note||E'\n'||$4 end,
+				 version=version+1,updated_at=now()
+				 where id=$1`,
+				b.ID, m.ID, due, fmt.Sprintf("场地临时维护（维护单 #%d）：%s。请选择换场/顺延/退款。", m.ID, in.Reason)); err != nil {
+				return err
+			}
+			// 锁定时旧场地若已预热/开灯，立即关灯留痕（安全；换场后在新场地重新授权开灯）
+			if b.LightOffAt == nil && (b.WarmupAt != nil || b.LightOnAt != nil) {
 				if _, err := tx.Exec(ctx,
-					`insert into disputes(booking_id,opened_by,auto_opened,status,issue,created_at)
-					 values($1,$2,false,'open',$3,now()) on conflict (booking_id) do nothing`,
-					b.ID, in.StaffID, "场地临时维护："+in.Reason); err != nil {
+					`insert into light_records(booking_id,court_id,action,command_source,success,detail,occurred_at)
+					 values($1,$2,'off','operator',true,'maintenance lock, pending relocation',$3)`,
+					b.ID, b.CourtID, now); err != nil {
 					return err
 				}
-				if b.LightOffAt == nil {
-					if _, err := tx.Exec(ctx,
-						`insert into light_records(booking_id,court_id,action,command_source,success,detail,occurred_at)
-						 values($1,$2,'off','operator',true,'maintenance lock',$3)`,
-						b.ID, b.CourtID, s.now(ctx)); err != nil {
-						return err
-					}
+				if _, err := tx.Exec(ctx,
+					`update bookings set light_off_at=coalesce(light_off_at,$2) where id=$1`, b.ID, now); err != nil {
+					return err
 				}
 			}
-			if err := emitEvent(ctx, tx, "booking.affected_by_maintenance", "operator", &b.ID, &b.VenueID, &b.CourtID, &in.StaffID,
-				map[string]any{"maintenance_id": m.ID, "old_status": b.Status}); err != nil {
+			if err := emitEvent(ctx, tx, "booking.relocation_pending", "operator", &b.ID, &b.VenueID, &b.CourtID, &in.StaffID,
+				map[string]any{"maintenance_id": m.ID, "old_status": b.Status, "due_at": due,
+					"reason": in.Reason, "entered_old_court": b.FirstGateAt != nil}); err != nil {
 				return err
 			}
 		}
@@ -119,16 +123,112 @@ func (s *Service) CreateMaintenance(ctx context.Context, in MaintenanceInput) (*
 	return &m, nil
 }
 
-func (s *Service) ReleaseMaintenance(ctx context.Context, id, staffID int64) error {
-	return inTx(ctx, s.pool(), func(tx pgx.Tx) error {
+// CompleteRepair 维修完工上报：active -> repair_done。
+// 此时场地仍不开放预约/闸机，必须等待前台验收（verified）。
+func (s *Service) CompleteRepair(ctx context.Context, id, staffID int64) (*store.Maintenance, error) {
+	err := inTx(ctx, s.pool(), func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
-			`update maintenance_windows set status='released',released_by=$2,released_at=now()
-			 where id=$1 and status='active'`, id, staffID)
+			`update maintenance_windows set status='repair_done',repair_finished_at=now()
+			 where id=$1 and status='active'`, id)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return ce("NOT_FOUND", "维护记录不存在或已释放", ErrNotFound)
+			return ce("NOT_REPAIRABLE", "维护记录不存在或当前状态不可上报完工（需 active）", ErrIllegalState)
+		}
+		var venueID, courtID int64
+		if err := tx.QueryRow(ctx, `select venue_id,court_id from maintenance_windows where id=$1`, id).Scan(&venueID, &courtID); err != nil {
+			return err
+		}
+		return emitEvent(ctx, tx, "maintenance.repair_completed", "operator", nil, &venueID, &courtID, &staffID,
+			map[string]any{"maintenance_id": id})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetMaintenance(ctx, id)
+}
+
+// VerifyMaintenance 前台验收：pass=true 时维护单 verified 且场地重新开放预约；
+// pass=false 验收不通过，退回 active 继续维修。
+func (s *Service) VerifyMaintenance(ctx context.Context, id, staffID int64, pass bool, note string) (*store.Maintenance, error) {
+	err := inTx(ctx, s.pool(), func(tx pgx.Tx) error {
+		var courtID, venueID int64
+		var status string
+		if err := tx.QueryRow(ctx,
+			`select court_id,venue_id,status from maintenance_windows where id=$1 for update`, id).
+			Scan(&courtID, &venueID, &status); err != nil {
+			if err == pgx.ErrNoRows {
+				return ce("NOT_FOUND", "维护记录不存在", ErrNotFound)
+			}
+			return err
+		}
+		if !pass {
+			if status != "repair_done" && status != "active" {
+				return ce("NOT_VERIFIABLE", "仅维修中/待验收的维护可退回重修", ErrIllegalState)
+			}
+			if _, err := tx.Exec(ctx,
+				`update maintenance_windows set status='active',verify_note=$2,verified_by=$3,verified_at=now() where id=$1`,
+				id, "验收不通过，退回维修："+note, staffID); err != nil {
+				return err
+			}
+			return emitEvent(ctx, tx, "maintenance.verify_rejected", "front", nil, &venueID, &courtID, &staffID,
+				map[string]any{"maintenance_id": id, "note": note})
+		}
+		if status != "repair_done" && status != "active" {
+			return ce("ALREADY_VERIFIED", "维护单已验收或已释放（"+status+"）", ErrIllegalState)
+		}
+		if _, err := tx.Exec(ctx,
+			`update maintenance_windows set status='verified',verified_by=$2,verified_at=now(),verify_note=$3,
+			 repair_finished_at=coalesce(repair_finished_at,now())
+			 where id=$1`, id, staffID, note); err != nil {
+			return err
+		}
+		return emitEvent(ctx, tx, "maintenance.verified", "front", nil, &venueID, &courtID, &staffID,
+			map[string]any{"maintenance_id": id, "note": note})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetMaintenance(ctx, id)
+}
+
+func (s *Service) GetMaintenance(ctx context.Context, id int64) (*store.Maintenance, error) {
+	m, err := scanMaintenance(s.pool().QueryRow(ctx,
+		`select `+maintenanceColumns+` from maintenance_windows where id=$1`, id))
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func scanMaintenance(row pgx.Row) (store.Maintenance, error) {
+	var m store.Maintenance
+	err := row.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason, &m.Status,
+		&m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt,
+		&m.RepairFinishedAt, &m.VerifiedBy, &m.VerifiedAt, &m.VerifyNote, &m.CreatedAt)
+	if err == pgx.ErrNoRows {
+		return m, ErrNotFound
+	}
+	return m, err
+}
+
+const maintenanceColumns = `id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,
+	repair_finished_at,verified_by,verified_at,verify_note,created_at`
+
+// ReleaseMaintenance 运营直接撤销维护锁定（仅 active/repair_done 可撤销，如误登记）。
+// 与前台验收等效：场地立即恢复开放。
+func (s *Service) ReleaseMaintenance(ctx context.Context, id, staffID int64) error {
+	return inTx(ctx, s.pool(), func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`update maintenance_windows set status='released',released_by=$2,released_at=now(),
+			 verified_by=coalesce(verified_by,$2),verified_at=coalesce(verified_at,now())
+			 where id=$1 and status in ('active','repair_done')`, id, staffID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ce("NOT_FOUND", "维护记录不存在或已结束", ErrNotFound)
 		}
 		var venueID, courtID int64
 		if err := tx.QueryRow(ctx, `select venue_id,court_id from maintenance_windows where id=$1`, id).Scan(&venueID, &courtID); err != nil {
@@ -373,15 +473,19 @@ func int64Ptr(i int64) *int64 { return &i }
 // ---------- 查询：争议全景 ----------
 
 type DisputeDetail struct {
-	Dispute      *store.Dispute      `json:"dispute"`
-	Booking      *store.Booking      `json:"booking"`
-	Payments     []store.Payment     `json:"payments"`
-	GateRecords  []store.GateRecord  `json:"gate_records"`
-	LightRecords []store.LightRecord `json:"light_records"`
-	FrontRecords []store.FrontRecord `json:"front_records"`
-	Events       []store.Event       `json:"events"`
-	Maintenance  []store.Maintenance `json:"maintenance"`
-	Verdict      *VerdictEvidence    `json:"verdict"`
+	Dispute         *store.Dispute               `json:"dispute"`
+	Booking         *store.Booking               `json:"booking"`
+	Payments        []store.Payment              `json:"payments"`
+	GateRecords     []store.GateRecord           `json:"gate_records"`
+	LightRecords    []store.LightRecord          `json:"light_records"`
+	FrontRecords    []store.FrontRecord          `json:"front_records"`
+	Events          []store.Event                `json:"events"`
+	Maintenance     []store.Maintenance          `json:"maintenance"`
+	DeviceSync      []store.DevicePermissionSync `json:"device_permission_sync"`
+	VacateReminders []store.VacateReminder       `json:"vacate_reminders"`
+	RelocatedFrom   *store.Booking               `json:"relocated_from,omitempty"`
+	RelocatedTo     *store.Booking               `json:"relocated_to,omitempty"`
+	Verdict         *VerdictEvidence             `json:"verdict"`
 }
 
 func (s *Service) GetDispute(ctx context.Context, id int64) (*store.Dispute, error) {
@@ -548,22 +652,75 @@ func (s *Service) BookingTimeline(ctx context.Context, bookingID int64) (*Disput
 	}
 	rows.Close()
 
+	// 维护记录：覆盖订单当前场地与原场地（换场后旧场地才有维护单）
+	maintCourt := b.CourtID
+	if b.OriginalCourtID != nil {
+		maintCourt = *b.OriginalCourtID
+	}
 	rows, err = pool.Query(ctx,
-		`select id,venue_id,court_id,start_time,end_time,reason,status,created_by,released_by,released_at,created_at
-		 from maintenance_windows where court_id=$1 order by id`, b.CourtID)
+		`select `+maintenanceColumns+`
+		 from maintenance_windows
+		 where court_id=$1 or id=coalesce($2,0) order by id`, maintCourt, b.RelocationMaintenanceID)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var m store.Maintenance
-		if err := rows.Scan(&m.ID, &m.VenueID, &m.CourtID, &m.StartTime, &m.EndTime, &m.Reason, &m.Status,
-			&m.CreatedBy, &m.ReleasedBy, &m.ReleasedAt, &m.CreatedAt); err != nil {
+		m, e := scanMaintenance(rows)
+		if e != nil {
 			rows.Close()
-			return nil, err
+			return nil, e
 		}
 		d.Maintenance = append(d.Maintenance, m)
 	}
 	rows.Close()
+
+	// 闸机/灯控权限同步记录
+	rows, err = pool.Query(ctx,
+		`select id,booking_id,court_id,entry_code,device_type,permission,reason,sync_status,coalesce(created_by,0),created_at
+		 from device_permission_sync where booking_id=$1 order by id`, bookingID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var sy store.DevicePermissionSync
+		var by int64
+		if err := rows.Scan(&sy.ID, &sy.BookingID, &sy.CourtID, &sy.EntryCode, &sy.DeviceType,
+			&sy.Permission, &sy.Reason, &sy.SyncStatus, &by, &sy.CreatedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if by != 0 {
+			sy.CreatedBy = &by
+		}
+		d.DeviceSync = append(d.DeviceSync, sy)
+	}
+	rows.Close()
+
+	// 旧场地清场提醒
+	rows, err = pool.Query(ctx,
+		`select id,booking_id,venue_id,court_id,maintenance_id,message,status,cleared_by,reminded_at,cleared_at,created_at
+		 from vacate_reminders where booking_id=$1 order by id`, bookingID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var vr store.VacateReminder
+		if err := rows.Scan(&vr.ID, &vr.BookingID, &vr.VenueID, &vr.CourtID, &vr.MaintenanceID, &vr.Message,
+			&vr.Status, &vr.ClearedBy, &vr.RemindedAt, &vr.ClearedAt, &vr.CreatedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		d.VacateReminders = append(d.VacateReminders, vr)
+	}
+	rows.Close()
+
+	// 换场链路的对端订单
+	if b.RelocatedFromBookingID != nil {
+		d.RelocatedFrom, _ = s.GetBooking(ctx, *b.RelocatedFromBookingID)
+	}
+	if b.RelocatedToBookingID != nil {
+		d.RelocatedTo, _ = s.GetBooking(ctx, *b.RelocatedToBookingID)
+	}
 
 	var disp store.Dispute
 	err = pool.QueryRow(ctx, `select id,booking_id,opened_by,auto_opened,status,issue,

@@ -79,6 +79,11 @@ func runJobs(ctx context.Context, svc *service.Service, every time.Duration) {
 		} else if n > 0 {
 			log.Printf("爽约自动裁决 %d 单", n)
 		}
+		if n, err := svc.AutoResolvePendingRelocations(ctx); err != nil {
+			log.Printf("job relocation-timeout error: %v", err)
+		} else if n > 0 {
+			log.Printf("换场逾期未决自动退款 %d 单", n)
+		}
 	}
 	tick()
 	for {

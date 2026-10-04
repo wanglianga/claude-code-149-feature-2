@@ -28,11 +28,12 @@ type Venue struct {
 }
 
 type Court struct {
-	ID       int64  `json:"id"`
-	VenueID  int64  `json:"venue_id"`
-	CourtNo  string `json:"court_no"`
-	Capacity int    `json:"capacity"`
-	Status   string `json:"status"`
+	ID                int64  `json:"id"`
+	VenueID           int64  `json:"venue_id"`
+	CourtNo           string `json:"court_no"`
+	Capacity          int    `json:"capacity"`
+	Status            string `json:"status"`
+	PriceCentsPerHour int64  `json:"price_cents_per_hour"` // 0 表示沿用场馆基础价
 }
 
 type Member struct {
@@ -80,17 +81,21 @@ type ExtraSlot struct {
 }
 
 type Maintenance struct {
-	ID         int64      `json:"id"`
-	VenueID    int64      `json:"venue_id"`
-	CourtID    int64      `json:"court_id"`
-	StartTime  time.Time  `json:"start_time"`
-	EndTime    time.Time  `json:"end_time"`
-	Reason     string     `json:"reason"`
-	Status     string     `json:"status"`
-	CreatedBy  *int64     `json:"created_by"`
-	ReleasedBy *int64     `json:"released_by"`
-	ReleasedAt *time.Time `json:"released_at"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID               int64      `json:"id"`
+	VenueID          int64      `json:"venue_id"`
+	CourtID          int64      `json:"court_id"`
+	StartTime        time.Time  `json:"start_time"`
+	EndTime          time.Time  `json:"end_time"`
+	Reason           string     `json:"reason"`
+	Status           string     `json:"status"` // active / repair_done / verified / released
+	CreatedBy        *int64     `json:"created_by"`
+	ReleasedBy       *int64     `json:"released_by"`
+	ReleasedAt       *time.Time `json:"released_at"`
+	RepairFinishedAt *time.Time `json:"repair_finished_at"`
+	VerifiedBy       *int64     `json:"verified_by"`
+	VerifiedAt       *time.Time `json:"verified_at"`
+	VerifyNote       string     `json:"verify_note"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 type Booking struct {
@@ -144,9 +149,47 @@ type Booking struct {
 	JudgeSource           *string    `json:"judge_source"`
 	Note                  string     `json:"note"`
 	CreatedSource         string     `json:"created_source"`
-	Version               int64      `json:"version"`
-	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at"`
+	// 临时换场链路
+	RelocationStatus        string     `json:"relocation_status"` // '' / pending / resolved
+	RelocationMaintenanceID *int64     `json:"relocation_maintenance_id,omitempty"`
+	OriginalCourtID         *int64     `json:"original_court_id,omitempty"`
+	RelocatedFromBookingID  *int64     `json:"relocated_from_booking_id,omitempty"`
+	RelocatedToBookingID    *int64     `json:"relocated_to_booking_id,omitempty"`
+	RelocationDueAt         *time.Time `json:"relocation_due_at,omitempty"`
+	VenueBorneCents         int64      `json:"venue_borne_cents"`
+	VacateRemindedAt        *time.Time `json:"vacate_reminded_at,omitempty"`
+	Version                 int64      `json:"version"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+}
+
+// DevicePermissionSync 换场后闸机/灯控权限同步记录（旧场地 revoke、新场地 grant）
+type DevicePermissionSync struct {
+	ID         int64     `json:"id"`
+	BookingID  int64     `json:"booking_id"`
+	CourtID    int64     `json:"court_id"`
+	EntryCode  string    `json:"entry_code"`
+	DeviceType string    `json:"device_type"` // gate / light
+	Permission string    `json:"permission"`  // grant / revoke
+	Reason     string    `json:"reason"`
+	SyncStatus string    `json:"sync_status"`
+	CreatedBy  *int64    `json:"created_by"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// VacateReminder 旧场地清场提醒（用户已扫码进入被维护场地时生成，防止爽约裁决误判占场）
+type VacateReminder struct {
+	ID            int64      `json:"id"`
+	BookingID     int64      `json:"booking_id"`
+	VenueID       int64      `json:"venue_id"`
+	CourtID       int64      `json:"court_id"`
+	MaintenanceID *int64     `json:"maintenance_id"`
+	Message       string     `json:"message"`
+	Status        string     `json:"status"` // pending / cleared
+	ClearedBy     *int64     `json:"cleared_by"`
+	RemindedAt    time.Time  `json:"reminded_at"`
+	ClearedAt     *time.Time `json:"cleared_at"`
+	CreatedAt     time.Time  `json:"created_at"`
 }
 
 type Participant struct {

@@ -154,6 +154,7 @@ func (s *Server) dispatchVenue(w http.ResponseWriter, r *http.Request) {
 
 type quoteReq struct {
 	VenueID      int64  `json:"venue_id"`
+	CourtID      int64  `json:"court_id"`
 	MemberID     int64  `json:"member_id"`
 	StartTime    string `json:"start_time"`
 	EndTime      string `json:"end_time"`
@@ -182,7 +183,7 @@ func (s *Server) handleQuotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := s.Svc.Quote(r.Context(), service.QuoteInput{
-		VenueID: req.VenueID, MemberID: req.MemberID,
+		VenueID: req.VenueID, CourtID: req.CourtID, MemberID: req.MemberID,
 		StartTime: st, EndTime: en,
 		RacketCount: req.RacketCount, ShuttleCount: req.ShuttleCount,
 	})
@@ -338,6 +339,8 @@ func (s *Server) dispatchBooking(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeOK(w, v)
+		case "relocation/options":
+			s.handleRelocationOptions(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -608,6 +611,9 @@ func (s *Server) dispatchBooking(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeOK(w, v)
+
+	case "relocation/resolve":
+		s.handleRelocationResolve(w, r)
 
 	default:
 		http.NotFound(w, r)
